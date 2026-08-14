@@ -1,0 +1,6 @@
+# Real credentials live here. Never commit — see .env.example for the shape.
+.env
+
+# Downloaded plugin binary + release artifacts (fetched by scripts/fetch-plugin.sh)
+plugins/
+.plugin-cache/

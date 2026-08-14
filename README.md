@@ -1,0 +1,210 @@
+# Vault as the issuer of Temporal Cloud API keys
+
+A local, self-contained demo of [`vault-plugin-secrets-temporalcloud`](https://github.com/ausmartway/vault-plugin-secrets-temporalcloud):
+HashiCorp Vault mints Temporal Cloud service accounts and API keys on demand,
+binds each key to a lease, and **deletes the key in Temporal Cloud the moment
+that lease ends**.
+
+Everything runs against a real Temporal Cloud account. Nothing is simulated —
+the API keys you see in the demo appear and disappear for real.
+
+```
+make demo     # interactive walkthrough, advances on ENTER
+make reset    # back to a clean state
+```
+
+---
+
+## The problem this solves
+
+Temporal Cloud API keys are static. In practice that means a key gets created
+once, pasted into CI, a `.env`, a teammate's shell history, and a secret
+manager nobody rotates. Nobody can answer two questions that auditors always
+ask: *who holds a working credential right now*, and *how fast can you take it
+away*.
+
+The usual mitigations don't really fix it. Short expiry times just move the
+outage risk around. Rotation runbooks depend on someone running them. Scoping
+helps, but only if someone remembers to scope.
+
+The dynamic-secrets model changes the shape of the problem:
+
+| | Static API key | Vault-issued |
+|---|---|---|
+| Who has it | Unknowable | Whoever holds an unexpired lease |
+| Lifetime | Until someone rotates it | The lease TTL (minutes) |
+| Revocation | Find it, delete it, hope | `vault lease revoke` — deleted in Temporal Cloud |
+| Scope | Whatever it was created with | Per-role, defined in Vault |
+| Blast radius on leak | Everything, indefinitely | One role, for the rest of one TTL |
+
+The key insight for the demo: **the lease is the leash**. Vault doesn't just
+forget the credential on revoke — it calls Temporal Cloud and deletes it.
+
+---
+
+## What the demo does
+
+`demo.sh` walks six steps, each a real command:
+
+1. **Register and mount the plugin.** Registration is by the binary's SHA256 —
+   Vault refuses to load a plugin whose hash doesn't match. This is the
+   supply-chain check, and it's why the release ships `_SHA256SUMS`.
+2. **Configure one bootstrap credential.** The last static key that will ever
+   exist. Reading the config back shows the key never comes out again.
+3. **Define two roles** — one with account-wide read, one scoped to a single
+   namespace. Each creates a real service account in Temporal Cloud. These are
+   templates; no API key exists yet.
+4. **Read a credential.** Vault mints a key, returns it under a lease, and the
+   demo uses that key against Temporal Cloud to prove it works.
+5. **Show the lease.** Renewal extends it without ever calling Temporal Cloud.
+6. **Revoke.** The same key is rejected seconds later — because it no longer
+   exists.
+
+---
+
+## Prerequisites
+
+| Tool | Why |
+|---|---|
+| `docker` | Runs Vault. No `vault` binary needed on the host — the demo drives the CLI inside the container. |
+| [`tcld`](https://docs.temporal.io/cloud/tcld) | Verifies what actually happened in Temporal Cloud at each step. |
+| `jq` | Parsing `tcld` output. |
+| `curl`, `unzip`, `shasum` | Fetching and verifying the plugin release. |
+
+Plus a **Temporal Cloud account** with:
+
+- A **service-account-owned** API key with the `Admin` account role. This
+  matters: Temporal Cloud's `CreateApiKey` only accepts a service-account
+  owner, so a *user*-owned key configures fine and then fails on the first
+  `vault read creds/...`. Verify with:
+  ```bash
+  tcld --api-key "$TEMPORAL_API_KEY" apikey list \
+    | jq -r '.apiKeys[] | "\(.spec.displayName)\t\(.owner.ownerType)"'
+  ```
+  You want `ApikeyOwnerTypeServiceAccount`.
+- **At least one namespace**, for the namespace-scoped role in step 3.
+
+---
+
+## Setup
+
+```bash
+cp .env.example .env
+$EDITOR .env          # see the comments in the file for where each value comes from
+make check-ports      # confirm VAULT_PORT is free before anything starts
+make demo
+```
+
+`.env` is gitignored. Nothing in this repo commits a credential.
+
+### Make targets
+
+| Target | What it does |
+|---|---|
+| `make demo` | Start Vault if needed, run the interactive walkthrough |
+| `make auto` | Same walkthrough, no keypresses — smoke test or screen recording |
+| `make status` | What exists right now, in Vault *and* in Temporal Cloud |
+| `make reset` | Revoke leases, delete the demo service accounts, tear Vault down |
+| `make up` / `make down` | Start / stop Vault only |
+| `make plugin` | Download and checksum-verify the plugin binary |
+
+---
+
+## How it's wired
+
+```
+  make up
+    │
+    ├─ scripts/fetch-plugin.sh
+    │    downloads the release zip, verifies it against _SHA256SUMS,
+    │    extracts the binary to ./plugins/
+    │
+    └─ docker compose up
+         hashicorp/vault -dev, ./plugins mounted at /vault/plugins
+         │
+  demo.sh ──┤  vault plugin register -sha256=…    (supply-chain check)
+            │  vault secrets enable -path=temporalcloud
+            │  vault write  temporalcloud/config             ──► Temporal Cloud
+            │  vault write  temporalcloud/service-accounts/… ──► creates service accounts
+            │  vault read   temporalcloud/creds/…            ──► mints an API key
+            │  vault lease revoke                            ──► deletes the API key
+            │
+            └─ tcld … (read-only, verifies each effect independently)
+```
+
+Vault runs in **dev mode**: in-memory storage, auto-unsealed, a single known
+root token. Correct for a demo, never for anything real.
+
+`./plugins` holds the plugin binary and nothing else, on purpose — Vault's
+`-dev-plugin-dir` tries to execute every file it finds there, so a stray README
+or checksum file stops the server from booting.
+
+---
+
+## Questions this demo tends to provoke
+
+**"What happens when Vault is down?"** Existing keys keep working until their
+lease expires — they're real Temporal Cloud keys, not proxied. You lose the
+ability to issue new ones, not the ability to use issued ones.
+
+**"What if Vault crashes without revoking?"** Every key is minted with a
+Temporal Cloud expiry past the lease's `max_ttl`, so an orphan expires on its
+own instead of lingering. Step 5 shows the Cloud-side expiry next to the
+5-minute lease.
+
+**"How many credentials can one role hand out at once?"** Temporal Cloud caps a
+service account at **20 non-expired keys**, so 20 concurrent leases per role.
+More consumers means more roles, which you want anyway for scoping.
+
+**"Isn't the bootstrap key still a static key?"** Yes — for exactly as long as
+it takes to run:
+
+```bash
+vault write -f temporalcloud/config/rotate-root
+```
+
+Vault mints a replacement, verifies it, stores it, and deletes its predecessor.
+After that, the only working root credential is one no human has ever seen.
+This is the real answer to "you've just moved the problem."
+
+> **Not in `demo.sh` on purpose.** `rotate-root` deletes the key in your `.env`
+> and replaces it with one Vault never reveals — so the value in `.env` stops
+> working and this demo can't be re-bootstrapped from it. Run it live only if
+> you're ready to mint a fresh bootstrap key afterwards. Note also that
+> `root_key_ttl` (90 days by default) has to be re-run before it expires, or
+> the mount stops issuing credentials.
+
+---
+
+## Troubleshooting
+
+**`port 8200 is already in use`** — `make check-ports` prints what's holding
+it. Change `VAULT_PORT` in `.env`; `VAULT_ADDR` follows automatically.
+
+**`rpc error: code = Unauthenticated`** right after minting a key — Temporal
+Cloud takes ~10s to propagate a new key across its auth layer, and the
+transition is uneven across nodes. `wait_for_key_valid` / `wait_for_key_revoked`
+poll for several consecutive identical results before the demo moves on; a
+single probe is not reliable in either direction.
+
+**`failed to load plugin` at container start** — something other than the
+plugin binary is in `./plugins/`. `make reset && make up`.
+
+**`api_key is required`** on `vault write config` — `.env` wasn't loaded, or
+`TEMPORAL_API_KEY` is empty.
+
+**Credentials fail with a permission error** — the bootstrap key is probably
+user-owned rather than service-account-owned. See Prerequisites.
+
+**A demo died halfway and left things behind** — `make reset` is idempotent and
+sweeps orphaned `demo-app-*` service accounts out of Temporal Cloud.
+
+---
+
+## What this is not
+
+Dev-mode Vault, a root token in a file, and a single bootstrap credential
+pasted in by hand. The *pattern* is production-shaped; this deployment is not.
+In production: real storage and seal, an auth method instead of a root token,
+Vault policies limiting who can read which `creds/` path, and `rotate-root` run
+as soon as the engine is configured.
