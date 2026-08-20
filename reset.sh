@@ -10,7 +10,8 @@
 # shellcheck source=scripts/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/scripts/common.sh"
 
-SA_NAMES=(demo-app-readonly demo-app-namespace)
+# Defined in common.sh so these are always the names demo.sh just created.
+SA_NAMES=("$SA_BROAD" "$SA_SCOPED" "$SA_METRICS")
 
 if vault status >/dev/null 2>&1 && vault secrets list -format=json 2>/dev/null | grep -q "\"$MOUNT/\""; then
     echo "==> Revoking outstanding leases"
@@ -30,7 +31,14 @@ else
 fi
 
 echo "==> Stopping Vault"
-docker compose -f "$REPO_ROOT/docker-compose.yml" down -v >/dev/null 2>&1 || true
+# Do not swallow this. Discarding the output and `|| true`-ing the failure meant
+# a teardown could fail and the script would still print "Clean." at the end —
+# leaving a container holding port 8200 that the operator was told was gone.
+if ! down_output="$(docker compose -f "$REPO_ROOT/docker-compose.yml" down -v 2>&1)"; then
+    echo "    could not stop Vault:"
+    echo "$down_output" | sed 's/^/      /'
+    echo "    run 'docker compose down -v' by hand before the next demo"
+fi
 
 echo "==> Removing the downloaded plugin binary"
 rm -rf "$PLUGIN_DIR"
@@ -40,8 +48,17 @@ rm -rf "$PLUGIN_DIR"
 # the next demo starts from a genuinely clean account.
 if command -v tcld >/dev/null 2>&1; then
     echo "==> Checking Temporal Cloud for orphaned demo service accounts"
-    orphans="$(tcld --api-key "$TEMPORAL_API_KEY" service-account list 2>/dev/null |
-        jq -r '.serviceAccount[]? | select(.spec.name | startswith("demo-app-")) | "\(.id)\t\(.spec.name)"')"
+    # Report a failed lookup instead of swallowing it. Under `set -euo pipefail`
+    # a failing tcld here used to abort the whole reset with stderr discarded —
+    # so the operator saw neither "Clean." nor any reason why. A sweep that
+    # cannot run is exactly when you need to be told.
+    # --page-size: tcld pages at 10 by default, which would hide orphans on an
+    # account that has more than ten service accounts.
+    if ! sa_list="$(tcld --api-key "$TEMPORAL_API_KEY" service-account list --page-size 100 2>&1)"; then
+        echo "    could not reach Temporal Cloud — check for leftover demo-app-* accounts by hand"
+        sa_list='{}'
+    fi
+    orphans="$(jq -r '.serviceAccount[]? | select(.spec.name | startswith("demo-app-")) | "\(.id)\t\(.spec.name)"' <<<"$sa_list")"
     if [[ -n "$orphans" ]]; then
         echo "$orphans" | while IFS=$'\t' read -r id name; do
             echo "    deleting orphan: $name ($id)"

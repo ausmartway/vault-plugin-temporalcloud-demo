@@ -23,16 +23,27 @@ set +a
 
 : "${TEMPORAL_API_KEY:?set TEMPORAL_API_KEY in .env}"
 : "${TEMPORAL_ADMIN_SA_ID:?set TEMPORAL_ADMIN_SA_ID in .env}"
+: "${TEMPORAL_NAMESPACE:?set TEMPORAL_NAMESPACE in .env}"
 
 export VAULT_PORT="${VAULT_PORT:-8200}"
 export VAULT_TOKEN="${VAULT_TOKEN:-root}"
 export MOUNT="${MOUNT:-temporalcloud}"
-export PLUGIN_VERSION="${PLUGIN_VERSION:-0.0.1}"
+export PLUGIN_VERSION="${PLUGIN_VERSION:-0.1.0}"
 export PLUGIN_NAME="vault-plugin-secrets-temporalcloud"
 export PLUGIN_DIR="$REPO_ROOT/plugins"
 
 # Derived, never set in .env: one port, one address, no chance of drift.
 export VAULT_ADDR="http://127.0.0.1:${VAULT_PORT}"
+
+# The Vault role name is also the Temporal Cloud service account name, so the
+# names live here rather than in demo.sh — reset.sh has to delete exactly what
+# demo.sh created, and one definition is the only way that stays true.
+# The scoped role's name follows TEMPORAL_NAMESPACE so it can never advertise a
+# namespace .env no longer points at. Only the prefix is used: the account
+# suffix in "vault-test.rgumq" is noise in a service account name.
+export SA_BROAD="demo-app-account-level-read"
+export SA_SCOPED="demo-app-${TEMPORAL_NAMESPACE%%.*}-namespace-write"
+export SA_METRICS="demo-app-metrics-read"
 
 # The demo drives Vault through the CLI inside the container, so the host does
 # not need a `vault` binary installed. This wrapper is what every script calls.

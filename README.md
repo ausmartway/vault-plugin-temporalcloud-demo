@@ -51,11 +51,14 @@ forget the credential on revoke — it calls Temporal Cloud and deletes it.
    supply-chain check, and it's why the release ships `_SHA256SUMS`.
 2. **Configure one bootstrap credential.** The last static key that will ever
    exist. Reading the config back shows the key never comes out again.
-3. **Define two roles** — one with account-wide read, one scoped to a single
-   namespace. Each creates a real service account in Temporal Cloud. These are
+3. **Define three roles** — one with account-wide read, one scoped to a single
+   namespace, one `metrics-read` for a scraper that should never see a
+   workflow. Each creates a real service account in Temporal Cloud. These are
    templates; no API key exists yet.
 4. **Read a credential.** Vault mints a key, returns it under a lease, and the
-   demo uses that key against Temporal Cloud to prove it works.
+   demo uses that key against Temporal Cloud to prove it works. The same read
+   runs three times — three distinct keys under three independent leases,
+   because nothing is cached or shared between consumers.
 5. **Show the lease.** Renewal extends it without ever calling Temporal Cloud.
 6. **Revoke.** The same key is rejected seconds later — because it no longer
    exists.
@@ -69,6 +72,7 @@ forget the credential on revoke — it calls Temporal Cloud and deletes it.
 | `docker` | Runs Vault. No `vault` binary needed on the host — the demo drives the CLI inside the container. |
 | [`tcld`](https://docs.temporal.io/cloud/tcld) | Verifies what actually happened in Temporal Cloud at each step. |
 | `jq` | Parsing `tcld` output. |
+| `pv` | demo-magic simulates typing with it. Interactive runs only — `make auto` doesn't need it. Not preinstalled on macOS: `brew install pv`. |
 | `curl`, `unzip`, `shasum` | Fetching and verifying the plugin release. |
 
 Plus a **Temporal Cloud account** with:
@@ -167,6 +171,11 @@ Vault mints a replacement, verifies it, stores it, and deletes its predecessor.
 After that, the only working root credential is one no human has ever seen.
 This is the real answer to "you've just moved the problem."
 
+Deleting the predecessor is now guaranteed rather than conditional: plugin
+0.1.0 reads `api_key_id` out of the bootstrap key's own JWT instead of asking
+an operator to supply it, so the ID rotate-root deletes always names the key
+actually in use.
+
 > **Not in `demo.sh` on purpose.** `rotate-root` deletes the key in your `.env`
 > and replaces it with one Vault never reveals — so the value in `.env` stops
 > working and this demo can't be re-bootstrapped from it. Run it live only if
@@ -181,11 +190,17 @@ This is the real answer to "you've just moved the problem."
 **`port 8200 is already in use`** — `make check-ports` prints what's holding
 it. Change `VAULT_PORT` in `.env`; `VAULT_ADDR` follows automatically.
 
-**`rpc error: code = Unauthenticated`** right after minting a key — Temporal
-Cloud takes ~10s to propagate a new key across its auth layer, and the
-transition is uneven across nodes. `wait_for_key_valid` / `wait_for_key_revoked`
-poll for several consecutive identical results before the demo moves on; a
-single probe is not reliable in either direction.
+**`rpc error: code = Unauthenticated`** right after minting a key, or a revoked
+key that still works — this is auth-layer lag, not the plugin. The plugin
+confirms every mutating Cloud Ops call by reading the resource back and blocking
+until it reached the requested state (deletion via `RESOURCE_STATE_DELETED`, not
+via `NotFound`), so **nothing in this demo waits on the Cloud Ops API**. But
+authenticating *with* a key exercises a different plane, and that one lags
+independently: on back-to-back runs of `demo.sh` we saw one pass instantly and
+the next reject a fresh key and accept a revoked one — while `apikey list`
+already reported zero keys. That is why `wait_for_key_valid` /
+`wait_for_key_revoked` wrap only the two `tcld --api-key "$API_KEY"` calls, and
+require several consecutive identical results before moving on.
 
 **`failed to load plugin` at container start** — something other than the
 plugin binary is in `./plugins/`. `make reset && make up`.

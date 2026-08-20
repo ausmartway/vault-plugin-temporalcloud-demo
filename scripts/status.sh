@@ -19,8 +19,11 @@ else
     echo "not running — 'make up' to start it"
 fi
 
+# --page-size: tcld pages service accounts at 10 by default, and a status check
+# that silently omits what you are looking for is worse than no status check.
+# `apikey list` has no such flag, so nothing to do there.
 hdr "Temporal Cloud service accounts"
-tcld --api-key "$TEMPORAL_API_KEY" service-account list |
+tcld --api-key "$TEMPORAL_API_KEY" service-account list --page-size 100 |
     jq -r '.serviceAccount[] | "\(.spec.name)\t\(.spec.access.accountAccess.role)\t\(.id)"'
 
 hdr "Temporal Cloud API keys"

@@ -18,7 +18,13 @@ check-env: ## Fail early if .env is missing
 
 .PHONY: check-ports
 check-ports: check-env ## Verify VAULT_PORT is free before starting anything
-	@if lsof -nP -iTCP:$(VAULT_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
+# The demo's own container holds the port once it is up, so a plain "is anything
+# listening?" check turns `make demo` into a one-shot command: after a Ctrl-C the
+# obvious recovery (run it again) is refused, and so is `make up`. Recognise our
+# own container and reuse it; only a foreign listener is a real conflict.
+	@if [ -n "$$(docker compose ps --status running --quiet vault 2>/dev/null)" ]; then \
+		echo "port $(VAULT_PORT) is held by this demo's own Vault — reusing it"; \
+	elif lsof -nP -iTCP:$(VAULT_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
 		echo "ERROR: port $(VAULT_PORT) is already in use:"; \
 		lsof -nP -iTCP:$(VAULT_PORT) -sTCP:LISTEN; \
 		echo "Change VAULT_PORT in .env, or stop the process above."; \
