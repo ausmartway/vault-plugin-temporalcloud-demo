@@ -4,3 +4,6 @@
 # Downloaded plugin binary + release artifacts (fetched by scripts/fetch-plugin.sh)
 plugins/
 .plugin-cache/
+
+# Local design notes — working material, not part of what a customer reads.
+docs/superpowers/
