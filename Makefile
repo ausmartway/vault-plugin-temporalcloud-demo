@@ -20,7 +20,7 @@ check-env: ## Fail early if .env is missing
 check-ports: check-env ## Verify VAULT_PORT is free before starting anything
 # The demo's own container holds the port once it is up, so a plain "is anything
 # listening?" check turns `make demo` into a one-shot command: after a Ctrl-C the
-# obvious recovery (run it again) is refused, and so is `make up`. Recognise our
+# obvious recovery (run it again) is refused, and so is `make up`. Recognize our
 # own container and reuse it; only a foreign listener is a real conflict.
 	@if [ -n "$$(docker compose ps --status running --quiet vault 2>/dev/null)" ]; then \
 		echo "port $(VAULT_PORT) is held by this demo's own Vault — reusing it"; \
@@ -55,7 +55,7 @@ reset: ## Revoke leases, delete Temporal Cloud service accounts, tear Vault down
 	@./reset.sh
 
 .PHONY: status
-status: ## Show what currently exists in Vault and in Temporal Cloud
+status: ## Show what exists in Vault and in Temporal Cloud
 	@./scripts/status.sh
 
 .PHONY: down

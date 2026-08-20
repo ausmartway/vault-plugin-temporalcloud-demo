@@ -32,7 +32,7 @@ preflight_clean() {
     [[ -z "$existing" ]] && return 0
     echo "ERROR: these demo service accounts already exist in Temporal Cloud:" >&2
     echo "$existing" | sed 's/^/  - /' >&2
-    echo "Vault will refuse to recreate them. Run 'make reset' first." >&2
+    echo "Vault refuses to recreate them. Run 'make reset' first." >&2
     exit 1
 }
 preflight_clean
@@ -170,7 +170,7 @@ clear
 say "Vault as the issuer of Temporal Cloud API keys"
 cat <<'EOF'
 
-The problem: Temporal Cloud API keys are static. They get pasted into CI, into
+The problem: Temporal Cloud API keys are static. People paste them into CI, into
 a teammate's shell history, into a secret manager nobody rotates. When someone
 leaves, you find out how many places that key lives.
 
@@ -289,7 +289,7 @@ fi
 say "Capture one and actually use it."
 pe "API_KEY=\$(vault read -field=api_key $MOUNT/creds/$SA_SCOPED)"
 
-say "The key exists the moment Vault returns it. Its auth layer needs a beat:"
+say "The key exists the moment Vault returns it. Its auth layer takes a few seconds to catch up:"
 pe_ok "wait_for_key_valid \"\$API_KEY\""
 # Be careful what this claims. It proves the key authenticates — nothing more.
 # `namespace list` succeeds on the account-level `read`, not on the namespace
@@ -327,7 +327,7 @@ pe_ok "tc apikey list | jq -r '.apiKeys[] | select(.spec.displayName | startswit
 # is the first thing a security-minded audience asks about. Answer it unprompted:
 # Temporal Cloud rejects any API key expiry under 24 hours, so the plugin floors
 # it there. Vault revokes at 5 minutes; the 24h is only the backstop.
-printf '\033[90m  The lease is 5 minutes. The Cloud-side expiry is 24 hours because\n  Temporal Cloud will not accept less — it is the self-destruct if Vault\n  dies before it can revoke, not the credential lifetime.\033[0m\n'
+printf '\033[90m  The lease is 5 minutes. The Cloud-side expiry is 24 hours because\n  Temporal Cloud does not accept less — it is the self-destruct if Vault\n  dies before it can revoke, not the credential lifetime.\033[0m\n'
 
 ########################################################################
 say "6. Revoke — and watch them disappear from Temporal Cloud"
@@ -366,6 +366,6 @@ Worth mentioning if it comes up:
     `vault write -f temporalcloud/config/rotate-root` replaces it, and Vault
     then holds a root credential no human has ever seen.
 
-Run `make reset` to delete the service accounts and tear Vault down.
+To delete the service accounts and tear Vault down, run `make reset`.
 
 EOF
