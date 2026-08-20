@@ -158,7 +158,8 @@ ability to issue new ones, not the ability to use issued ones.
 **"What if Vault crashes without revoking?"** Vault mints every key with a
 Temporal Cloud expiry past the lease's `max_ttl`, so an orphan expires on its
 own instead of lingering. Step 5 shows the Cloud-side expiry next to the
-5-minute lease.
+5-minute lease. That expiry also caps renewal: Vault refuses to extend a lease
+past the life of the key behind it, so a lease never outlives its credential.
 
 **"How many credentials can one role hand out at once?"** Temporal Cloud caps a
 service account at *20 non-expired keys*, so 20 concurrent leases per role.

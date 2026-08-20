@@ -28,7 +28,7 @@ set +a
 export VAULT_PORT="${VAULT_PORT:-8200}"
 export VAULT_TOKEN="${VAULT_TOKEN:-root}"
 export MOUNT="${MOUNT:-temporalcloud}"
-export PLUGIN_VERSION="${PLUGIN_VERSION:-0.1.0}"
+export PLUGIN_VERSION="${PLUGIN_VERSION:-0.1.1}"
 export PLUGIN_NAME="vault-plugin-secrets-temporalcloud"
 export PLUGIN_DIR="$REPO_ROOT/plugins"
 
