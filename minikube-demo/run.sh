@@ -4,6 +4,7 @@
 # will delete when its lease ends.
 #
 #   ./run.sh up        bring up Vault, minikube, the image and the worker
+#   ./run.sh up --vso  the same, but the Vault Secrets Operator syncs the key
 #   ./run.sh transfer  start one money transfer from this laptop
 #   ./run.sh rotate    replace the worker's key without restarting the pod
 #   ./run.sh status    what exists right now, on all three sides
@@ -500,26 +501,82 @@ wait_for_poller() {
 # Subcommands
 ########################################################################
 cmd_up() {
+    # Validated before any work happens: a typo should cost nothing, not a
+    # minikube start and an image build.
+    local vso_mode=0
+    if [[ -n "${1:-}" ]]; then
+        if [[ "$1" == "--vso" ]]; then
+            vso_mode=1
+        else
+            fail "unknown argument: $1 (did you mean --vso?)"
+        fi
+    fi
+
     preflight
     resolve_endpoint
     vault_up
-    vault_role
     minikube_up
     build_image
 
-    say "Credential"
-    read -r WORKER_LEASE WORKER_KEY <<<"$(mint_key "$WORKER_ROLE")"
-    write_secret "$WORKER_KEY"
-    info "minted a key and wrote it to secret/$SECRET_NAME"
-    info "lease: $WORKER_LEASE"
-    # Recorded so `rotate` can revoke precisely this lease later, proving the
-    # worker moved off this key rather than merely still having a valid one.
-    printf '%s\n' "$WORKER_LEASE" >"$DEMO_DIR/.worker-lease"
+    # Which role the confirmation probe draws its key from. It cannot be assumed
+    # to be the push-mode role: a clean checkout driven only with --vso never
+    # creates that one.
+    local probe_role="$WORKER_ROLE"
+
+    if ((vso_mode)); then
+        probe_role="$WORKER_ROLE_VSO"
+        vault_role_vso
+
+        # rbac.yaml before Vault is configured, because the token reviewer's
+        # token is read out of a Secret this creates.
+        kc apply -f "$DEMO_DIR/k8s/vso/rbac.yaml" >/dev/null ||
+            fail "could not apply k8s/vso/rbac.yaml"
+        vault_k8s_auth
+        vso_install
+
+        # The two modes cannot both own the Secret. VSO's destination.create
+        # makes it the owner, so any hand-written Secret is removed first —
+        # otherwise VSO and `kubectl apply` quietly contend over it and the
+        # worker's credential depends on which one wrote last.
+        say "Handing the Secret over to VSO"
+        if kc get secret "$SECRET_NAME" >/dev/null 2>&1 &&
+            ! kc get vaultdynamicsecret "$SECRET_NAME" >/dev/null 2>&1; then
+            kc delete secret "$SECRET_NAME" >/dev/null
+            info "removed the hand-written Secret"
+        else
+            info "nothing to hand over"
+        fi
+        # Push mode's bookkeeping does not apply here: VSO owns the lease now,
+        # and a stale file would let `rotate` revoke a lease it does not manage.
+        rm -f "$DEMO_DIR/.worker-lease"
+
+        apply_vso_manifests
+    else
+        vault_role
+
+        # Leaving the VaultDynamicSecret in place would have VSO overwrite the
+        # key this mode is about to write by hand.
+        if kc get vaultdynamicsecret "$SECRET_NAME" >/dev/null 2>&1; then
+            say "Taking the Secret back from VSO"
+            kc delete vaultdynamicsecret "$SECRET_NAME" --wait >/dev/null
+            kc delete secret "$SECRET_NAME" --ignore-not-found >/dev/null
+            info "VSO no longer owns $SECRET_NAME"
+        fi
+
+        say "Credential"
+        read -r WORKER_LEASE WORKER_KEY <<<"$(mint_key "$WORKER_ROLE")"
+        write_secret "$WORKER_KEY"
+        info "minted a key and wrote it to secret/$SECRET_NAME"
+        info "lease: $WORKER_LEASE"
+        # Recorded so `rotate` can revoke precisely this lease later, proving the
+        # worker moved off this key rather than merely still having a valid one.
+        printf '%s\n' "$WORKER_LEASE" >"$DEMO_DIR/.worker-lease"
+    fi
 
     deploy_worker
 
     say "Confirming the worker authenticated"
-    mint_temp_key "$WORKER_ROLE"
+    mint_temp_key "$probe_role"
     STARTER_KEY="$TEMP_KEY"
     local pod since
     pod="$(current_pod)"
@@ -536,12 +593,20 @@ cmd_up() {
 
     say "Ready"
     info "./run.sh transfer   start a money transfer"
-    info "./run.sh rotate     replace the key without restarting the pod"
-    info "./run.sh status      what exists right now"
-    # Nothing renews this lease, so the worker stops working when it expires.
-    # Better said here than discovered mid-meeting.
-    printf '\n\033[90m    The lease expires in %s. Nothing renews it, so the worker stops\n' "$WORKER_TTL"
-    printf '    working then — run "./run.sh rotate" to hand it a fresh key.\033[0m\n'
+    info "./run.sh status     what exists right now"
+    if ((vso_mode)); then
+        info "./run.sh watch      watch VSO replace the credential, live"
+        # The opposite caveat from push mode: here the credential keeps being
+        # replaced on its own, so there is nothing to run and nothing to expire.
+        printf '\n\033[90m    VSO replaces this key about every %s. Nothing to run:\n' "$VSO_TTL"
+        printf '    the rotation is the demo.\033[0m\n'
+    else
+        info "./run.sh rotate     replace the key without restarting the pod"
+        # Nothing renews this lease, so the worker stops working when it expires.
+        # Better said here than discovered mid-meeting.
+        printf '\n\033[90m    The lease expires in %s. Nothing renews it, so the worker stops\n' "$WORKER_TTL"
+        printf '    working then — run "./run.sh rotate" to hand it a fresh key.\033[0m\n'
+    fi
 }
 
 cmd_transfer() {
@@ -742,7 +807,7 @@ cmd_down() {
 }
 
 case "${1:-}" in
-up) cmd_up ;;
+up) cmd_up "${2:-}" ;;
 transfer) cmd_transfer ;;
 rotate) cmd_rotate ;;
 status) cmd_status ;;
