@@ -48,6 +48,15 @@ WORKER_MAX_TTL="1h"
 WORKER_ROLE_VSO="demo-k8s-worker-vso"
 VSO_TTL="2m"
 
+# Kubernetes auth, so nothing in the cluster holds a long-lived Vault
+# credential. VSO presents its ServiceAccount token; Vault verifies it with the
+# cluster's own TokenReview API and hands back a short-lived Vault token.
+K8S_AUTH_PATH="kubernetes"
+K8S_AUTH_ROLE="temporal-worker"
+K8S_AUTH_POLICY="temporal-worker-vso"
+K8S_AUTH_AUDIENCE="vault"
+VSO_SA="vso-temporal"
+
 say() { printf '\n\033[1;33m==> %s\033[0m\n' "$1"; }
 info() { printf '    %s\n' "$1"; }
 fail() {
@@ -153,6 +162,65 @@ vault_role_vso() {
             fail "could not create $WORKER_ROLE_VSO"
         info "created $WORKER_ROLE_VSO (ttl=max_ttl=$VSO_TTL)"
     fi
+}
+
+vault_k8s_auth() {
+    say "Vault Kubernetes auth"
+
+    vault auth list -format=json 2>/dev/null |
+        jq -e --arg p "$K8S_AUTH_PATH/" 'has($p)' >/dev/null ||
+        vault auth enable "$K8S_AUTH_PATH" >/dev/null
+
+    # Vault runs in a container on a different docker network from minikube, so
+    # the address kubectl uses is wrong here twice over: it is a host-forwarded
+    # port, and inside the Vault container 127.0.0.1 is the container itself.
+    # The minikube container's own address is what works — Docker Desktop routes
+    # between the two bridge networks.
+    local api_server reviewer_jwt ca_cert
+    api_server="https://$(minikube ip):8443"
+
+    # Vault has no in-cluster ServiceAccount token to authenticate its
+    # TokenReview calls with, so it is given one belonging to a ServiceAccount
+    # that holds system:auth-delegator and nothing else.
+    reviewer_jwt="$(kc get secret vault-auth-token \
+        -o jsonpath='{.data.token}' 2>/dev/null | base64 -d)"
+    [[ -n "$reviewer_jwt" ]] ||
+        fail "vault-auth-token is empty — apply k8s/vso/rbac.yaml first"
+
+    ca_cert="$(cat "$HOME/.minikube/ca.crt")" ||
+        fail "could not read $HOME/.minikube/ca.crt"
+
+    # disable_local_ca_jwt because Vault is not running in this cluster and has
+    # no in-pod CA bundle or token to fall back on.
+    vault write "auth/$K8S_AUTH_PATH/config" \
+        kubernetes_host="$api_server" \
+        kubernetes_ca_cert="$ca_cert" \
+        token_reviewer_jwt="$reviewer_jwt" \
+        disable_local_ca_jwt=true >/dev/null ||
+        fail "could not configure auth/$K8S_AUTH_PATH"
+    info "configured against $api_server"
+
+    # Least privilege, and worth reading aloud in a demo: VSO can read exactly
+    # one credential path and do nothing else in Vault.
+    printf 'path "%s/creds/%s" {\n  capabilities = ["read"]\n}\n' \
+        "$MOUNT" "$WORKER_ROLE_VSO" |
+        vault policy write "$K8S_AUTH_POLICY" - >/dev/null ||
+        fail "could not write policy $K8S_AUTH_POLICY"
+    info "wrote policy $K8S_AUTH_POLICY (read on $MOUNT/creds/$WORKER_ROLE_VSO)"
+
+    # The audience is set even though Vault 1.20 does not require it: 1.21 makes
+    # it mandatory, and a role without one starts failing on a Vault upgrade
+    # rather than at the moment it was misconfigured. It must match the
+    # audiences field in k8s/vso/vault-auth.yaml, because that is what VSO asks
+    # the apiserver to mint its token for.
+    vault write "auth/$K8S_AUTH_PATH/role/$K8S_AUTH_ROLE" \
+        bound_service_account_names="$VSO_SA" \
+        bound_service_account_namespaces="$K8S_NAMESPACE" \
+        audience="$K8S_AUTH_AUDIENCE" \
+        token_policies="$K8S_AUTH_POLICY" \
+        ttl=1h >/dev/null ||
+        fail "could not create auth role $K8S_AUTH_ROLE"
+    info "role $K8S_AUTH_ROLE bound to $K8S_NAMESPACE/$VSO_SA (audience=$K8S_AUTH_AUDIENCE)"
 }
 
 # Mints a key and prints "<lease_id> <api_key>". Both halves are needed: the

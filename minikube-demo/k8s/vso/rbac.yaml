@@ -1,0 +1,53 @@
+# Identities for the VSO credential path.
+#
+# Two ServiceAccounts, and they are not interchangeable:
+#
+#   vso-temporal   the identity VSO presents to Vault. Vault's Kubernetes auth
+#                  role is bound to this name, so this is the thing authorized
+#                  to read the Temporal Cloud credential.
+#
+#   vault-auth     the identity Vault itself uses to call the TokenReview API.
+#                  Vault runs outside this cluster, so it has no ServiceAccount
+#                  token of its own to authenticate that call with.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vso-temporal
+  namespace: temporal-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault-auth
+  namespace: temporal-demo
+---
+# Kubernetes stopped auto-creating token Secrets for ServiceAccounts in 1.24,
+# and `kubectl create token` returns one whose lifetime the apiserver caps —
+# which would break this demo silently, weeks later, for a reason nobody would
+# connect to this file. An explicit token Secret does not expire.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-auth-token
+  namespace: temporal-demo
+  annotations:
+    kubernetes.io/service-account.name: vault-auth
+type: kubernetes.io/service-account-token
+---
+# system:auth-delegator is the built-in ClusterRole that grants TokenReview.
+# Vault needs exactly this and nothing else.
+#
+# Cluster-scoped, so deleting the temporal-demo namespace does NOT remove it.
+# `run.sh down` deletes it by name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: temporal-demo-vault-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: vault-auth
+    namespace: temporal-demo
