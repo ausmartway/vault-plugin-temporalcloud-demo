@@ -8,6 +8,7 @@
 #   ./run.sh transfer  start one money transfer from this laptop
 #   ./run.sh rotate    replace the worker's key without restarting the pod
 #   ./run.sh status    what exists right now, on all three sides
+#   ./run.sh watch     watch VSO replace the credential, live
 #   ./run.sh down      remove everything this script created
 #
 # The argument: a long-running worker and a credential measured in minutes are
@@ -769,6 +770,55 @@ cmd_logs() {
         fail "no worker pod found"
 }
 
+# The VSO demo, such as it is: nothing to run, just something to watch.
+#
+# Deliberately reads only the Kubernetes API. cmd_status mints a probe key on
+# every call, and a loop built on that would mint one every few seconds and
+# exhaust Temporal Cloud's 20-non-expired-keys-per-service-account cap within a
+# minute — turning the observation tool into the thing that breaks the demo.
+#
+# Prints a fingerprint of the key, never the key.
+cmd_watch() {
+    say "Watching $SECRET_NAME"
+    info "the key changes about every $VSO_TTL; the restart count should not"
+    printf '\n'
+
+    local last=""
+    while true; do
+        local key fp pod restarts marker
+        # `|| true` on every lookup below, and it is not decoration. The script
+        # runs under `set -e -o pipefail`, so a missing Secret or a missing pod
+        # would fail the assignment and kill the loop — turning "nothing to watch
+        # yet" into a silent exit 1. Watching is exactly what someone does while
+        # waiting for those things to appear.
+        key="$(kc get secret "$SECRET_NAME" \
+            -o jsonpath='{.data.api_key}' 2>/dev/null | base64 -d 2>/dev/null)" || true
+        if [[ -z "$key" ]]; then
+            printf '    %s   no %s yet\n' "$(date -u +%H:%M:%S)" "$SECRET_NAME"
+            sleep 5
+            continue
+        fi
+        fp="$(printf '%s' "$key" | shasum -a 256 | cut -c1-12)"
+
+        # The pod name is printed rather than assumed constant: during a rollout
+        # there are briefly two, and a changed name here means the credential was
+        # picked up by a new process, which would not prove what this demo
+        # claims.
+        pod="$(kc get pod -l app="$DEPLOYMENT" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" || true
+        restarts="$(kc get pod -l app="$DEPLOYMENT" \
+            -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null)" || true
+
+        marker=""
+        [[ -n "$last" && "$fp" != "$last" ]] && marker="   <- rotated"
+        last="$fp"
+
+        printf '    %s   key %s   pod %s   restarts %s%s\n' \
+            "$(date -u +%H:%M:%S)" "$fp" "${pod:-none}" "${restarts:-?}" "$marker"
+        sleep 10
+    done
+}
+
 # Removes only what this script created. minikube itself is left running unless
 # --all is passed: someone running `down` to tidy up after a demo should not
 # lose a cluster they were using for something else.
@@ -812,6 +862,7 @@ transfer) cmd_transfer ;;
 rotate) cmd_rotate ;;
 status) cmd_status ;;
 logs) cmd_logs ;;
+watch) cmd_watch ;;
 down) cmd_down "${2:-}" ;;
 *)
     printf 'usage: %s {up|transfer|rotate|status|logs|down [--all]}\n' "${0##*/}"
