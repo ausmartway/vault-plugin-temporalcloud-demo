@@ -70,5 +70,10 @@ spec:
             # Vault rotate this key without restarting the pod.
             secretName: temporal-api-key
             items:
-              - key: api-key
+              # key is the Secret's data key; path is the filename in the
+              # volume. They differ on purpose: api_key matches the field the
+              # Vault plugin returns (and therefore what VSO writes), while
+              # api-key keeps the worker reading /vault/creds/api-key exactly as
+              # before. No Go code changes for either credential path.
+              - key: api_key
                 path: api-key

@@ -305,10 +305,16 @@ build_image() {
 # Writing the Secret through `create --dry-run | apply` rather than `create`
 # makes this idempotent: the same command installs the first key and replaces
 # every later one, which is exactly what `rotate` needs.
+#
+# The data key is api_key with an underscore, matching the field name the Vault
+# plugin returns. VSO names Secret keys after the Vault response fields, so
+# using the same name here means both credential paths produce an identical
+# Secret and the Deployment does not care which one filled it. The mounted
+# filename is still api-key — see the items block in k8s/worker.yaml.
 write_secret() {
     kubectl create secret generic "$SECRET_NAME" \
         --namespace "$K8S_NAMESPACE" \
-        --from-literal=api-key="$1" \
+        --from-literal=api_key="$1" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null ||
         fail "could not write the $SECRET_NAME secret"
 }
@@ -342,7 +348,7 @@ current_pod() {
 # The key the worker is holding right now, read back out of the cluster. Needed
 # so `rotate` can prove the old key is dead rather than assume it.
 current_secret_key() {
-    kc get secret "$SECRET_NAME" -o jsonpath='{.data.api-key}' 2>/dev/null |
+    kc get secret "$SECRET_NAME" -o jsonpath='{.data.api_key}' 2>/dev/null |
         base64 -d 2>/dev/null
 }
 
