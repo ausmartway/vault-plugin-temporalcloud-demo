@@ -1,0 +1,74 @@
+# The money-transfer worker, connected to Temporal Cloud with a Vault-issued
+# API key.
+#
+# The Secret this mounts is not in this file, and not in this repo: run.sh
+# creates it from `vault read`, so the credential never exists in git. Applying
+# this manifest without run.sh leaves the pod waiting for a credential, which is
+# the correct failure.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: temporal-connection
+  labels:
+    app: money-transfer-worker
+data:
+  # Filled in by run.sh from `tcld namespace get`, because the regional endpoint
+  # and namespace differ per account. Hardcoding either one breaks the demo for
+  # the next person who clones this.
+  TEMPORAL_ADDRESS: PLACEHOLDER_ADDRESS
+  TEMPORAL_NAMESPACE: PLACEHOLDER_NAMESPACE
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: money-transfer-worker
+  labels:
+    app: money-transfer-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: money-transfer-worker
+  template:
+    metadata:
+      labels:
+        app: money-transfer-worker
+    spec:
+      # A worker holds no local state, so it can go straight down. The default
+      # 30s grace period would make every rollout drag on stage for no benefit.
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: worker
+          image: money-transfer-worker:local
+          # The image is side-loaded with `minikube image load`, not pulled.
+          # Never, rather than IfNotPresent, so a stale cached tag can never be
+          # mistaken for a fresh build.
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: temporal-connection
+          volumeMounts:
+            - name: vault-creds
+              mountPath: /vault/creds
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: vault-creds
+          secret:
+            # Mounted as a file rather than injected as an environment variable.
+            # kubelet refreshes a mounted Secret in place, which is what lets
+            # Vault rotate this key without restarting the pod.
+            secretName: temporal-api-key
+            items:
+              - key: api-key
+                path: api-key

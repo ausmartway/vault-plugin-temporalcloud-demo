@@ -7,3 +7,7 @@ plugins/
 
 # Local design notes — working material, not part of what a customer reads.
 docs/superpowers/
+
+# Which Vault lease the minikube worker is currently holding. Runtime state,
+# rewritten on every `run.sh up` and `run.sh rotate`.
+minikube-demo/.worker-lease
