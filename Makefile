@@ -34,7 +34,7 @@ check-ports: check-env ## Verify VAULT_PORT is free before starting anything
 	fi
 
 .PHONY: plugin
-plugin: check-env ## Download + checksum-verify the plugin binary into ./plugins
+plugin: check-env ## Put the checksum-verified plugin binary in ./plugins, downloading only if needed
 	@./scripts/fetch-plugin.sh
 
 .PHONY: up

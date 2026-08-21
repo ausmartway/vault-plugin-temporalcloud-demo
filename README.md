@@ -110,7 +110,7 @@ make demo
 | `make status` | What exists right now, in Vault *and* in Temporal Cloud |
 | `make reset` | Revoke leases, delete the demo service accounts, tear Vault down |
 | `make up` / `make down` | Start / stop Vault only |
-| `make plugin` | Download and checksum-verify the plugin binary |
+| `make plugin` | Checksum-verify the plugin binary, downloading it only if it isn't already there |
 
 ---
 
@@ -124,8 +124,8 @@ verifies each effect against Temporal Cloud independently.
   make up
     │
     ├─ scripts/fetch-plugin.sh
-    │    downloads the release zip, verifies it against _SHA256SUMS,
-    │    extracts the binary to ./plugins/
+    │    downloads the release zip unless it is already cached, verifies
+    │    it against _SHA256SUMS, extracts the binary to ./plugins/
     │
     └─ docker compose up
          hashicorp/vault -dev, ./plugins mounted at /vault/plugins
