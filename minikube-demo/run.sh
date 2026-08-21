@@ -38,6 +38,16 @@ WORKER_ROLE="demo-k8s-worker"
 WORKER_TTL="10m"
 WORKER_MAX_TTL="1h"
 
+# The VSO path gets its own role, so the manual path's timings are untouched
+# and either mode can be torn down without disturbing the other.
+#
+# ttl == max_ttl is the whole point. Renewal can never extend a lease past
+# max_ttl, so VSO cannot keep one key alive — it has to mint a genuinely new
+# credential every couple of minutes. A longer max_ttl would have VSO quietly
+# renewing the same key for an hour, which demonstrates nothing in a meeting.
+WORKER_ROLE_VSO="demo-k8s-worker-vso"
+VSO_TTL="2m"
+
 say() { printf '\n\033[1;33m==> %s\033[0m\n' "$1"; }
 info() { printf '    %s\n' "$1"; }
 fail() {
@@ -127,6 +137,21 @@ vault_role() {
             ttl="$WORKER_TTL" max_ttl="$WORKER_MAX_TTL" \
             description='Money-transfer worker in minikube, issued by Vault' >/dev/null
         info "created $WORKER_ROLE (ttl=$WORKER_TTL, max_ttl=$WORKER_MAX_TTL)"
+    fi
+}
+
+vault_role_vso() {
+    say "Vault role for VSO"
+    if vault read "$MOUNT/service-accounts/$WORKER_ROLE_VSO" >/dev/null 2>&1; then
+        info "$WORKER_ROLE_VSO already exists"
+    else
+        vault write "$MOUNT/service-accounts/$WORKER_ROLE_VSO" \
+            account_role=read \
+            namespace_access="$TEMPORAL_NAMESPACE=write" \
+            ttl="$VSO_TTL" max_ttl="$VSO_TTL" \
+            description='Money-transfer worker, credential synced by VSO' >/dev/null ||
+            fail "could not create $WORKER_ROLE_VSO"
+        info "created $WORKER_ROLE_VSO (ttl=max_ttl=$VSO_TTL)"
     fi
 }
 
