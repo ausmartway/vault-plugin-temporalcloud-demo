@@ -57,6 +57,11 @@ K8S_AUTH_POLICY="temporal-worker-vso"
 K8S_AUTH_AUDIENCE="vault"
 VSO_SA="vso-temporal"
 
+# Pinned. An operator that changes version between demos is a variable nobody
+# wants to discover on stage.
+VSO_CHART_VERSION="1.5.1"
+VSO_NAMESPACE="vault-secrets-operator-system"
+
 say() { printf '\n\033[1;33m==> %s\033[0m\n' "$1"; }
 info() { printf '    %s\n' "$1"; }
 fail() {
@@ -70,7 +75,7 @@ kc() { kubectl --namespace "$K8S_NAMESPACE" "$@"; }
 # Preflight
 ########################################################################
 preflight() {
-    for cmd in minikube kubectl docker jq tcld temporal; do
+    for cmd in minikube kubectl docker jq tcld temporal helm; do
         require_cmd "$cmd"
     done
     docker info >/dev/null 2>&1 || fail "the Docker daemon is not running"
@@ -221,6 +226,48 @@ vault_k8s_auth() {
         ttl=1h >/dev/null ||
         fail "could not create auth role $K8S_AUTH_ROLE"
     info "role $K8S_AUTH_ROLE bound to $K8S_NAMESPACE/$VSO_SA (audience=$K8S_AUTH_AUDIENCE)"
+}
+
+vso_install() {
+    say "Vault Secrets Operator"
+    if helm status vault-secrets-operator -n "$VSO_NAMESPACE" >/dev/null 2>&1; then
+        info "already installed"
+    else
+        helm repo add hashicorp https://helm.releases.hashicorp.com >/dev/null 2>&1 || true
+        helm repo update hashicorp >/dev/null 2>&1
+        helm install vault-secrets-operator hashicorp/vault-secrets-operator \
+            --version "$VSO_CHART_VERSION" \
+            --namespace "$VSO_NAMESPACE" --create-namespace \
+            --wait --timeout 5m >/dev/null ||
+            fail "could not install the Vault Secrets Operator"
+        info "installed chart $VSO_CHART_VERSION"
+    fi
+
+    # Selected by label rather than by name: the chart's Deployment name is its
+    # own business and has changed between versions.
+    kubectl wait --for=condition=Available deployment \
+        -l app.kubernetes.io/name=vault-secrets-operator \
+        -n "$VSO_NAMESPACE" --timeout=180s >/dev/null ||
+        fail "the operator did not become ready"
+    info "operator ready"
+}
+
+apply_vso_manifests() {
+    say "VSO custom resources"
+    kc apply -f "$DEMO_DIR/k8s/vso/rbac.yaml" >/dev/null ||
+        fail "could not apply k8s/vso/rbac.yaml"
+
+    # Substituted rather than committed: the Vault port comes from .env so the
+    # demo can move off 8200 when something else is holding it.
+    sed -e "s|PLACEHOLDER_VAULT_ADDRESS|http://host.minikube.internal:${VAULT_PORT:-8200}|" \
+        "$DEMO_DIR/k8s/vso/vault-connection.yaml" | kc apply -f - >/dev/null ||
+        fail "could not apply the VaultConnection"
+
+    kc apply -f "$DEMO_DIR/k8s/vso/vault-auth.yaml" >/dev/null ||
+        fail "could not apply the VaultAuth"
+    kc apply -f "$DEMO_DIR/k8s/vso/dynamic-secret.yaml" >/dev/null ||
+        fail "could not apply the VaultDynamicSecret"
+    info "applied rbac, VaultConnection, VaultAuth, VaultDynamicSecret"
 }
 
 # Mints a key and prints "<lease_id> <api_key>". Both halves are needed: the

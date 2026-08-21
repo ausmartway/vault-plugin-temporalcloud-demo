@@ -1,0 +1,26 @@
+# How VSO proves who it is.
+#
+# No secret material here — VSO sends the vso-temporal ServiceAccount's token,
+# Vault checks it with the cluster's TokenReview API, and issues a short-lived
+# Vault token carrying the temporal-worker-vso policy. Nothing long-lived is
+# stored in the cluster.
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultAuth
+metadata:
+  name: temporal-vault-auth
+  namespace: temporal-demo
+spec:
+  vaultConnectionRef: temporal-vault
+  method: kubernetes
+  mount: kubernetes
+  kubernetes:
+    role: temporal-worker
+    serviceAccount: vso-temporal
+    # Must match the audience on the Vault auth role, which run.sh sets to
+    # "vault". This is what VSO asks the apiserver to mint its token for, and
+    # Vault rejects a token minted for anything else.
+    #
+    # Vault 1.20 only warns when a role has no audience; 1.21 requires one. Both
+    # sides are pinned here so an upgrade does not quietly break the demo.
+    audiences:
+      - vault

@@ -1,0 +1,15 @@
+# How VSO reaches Vault.
+#
+# host.minikube.internal is the host as seen from inside the cluster, and Vault
+# publishes its port there. Vault's own container address would not work: it
+# sits on a different docker network from these pods.
+#
+# Plain HTTP because this is a -dev Vault. A real deployment terminates TLS and
+# this becomes https with a caCertSecretRef.
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultConnection
+metadata:
+  name: temporal-vault
+  namespace: temporal-demo
+spec:
+  address: PLACEHOLDER_VAULT_ADDRESS
