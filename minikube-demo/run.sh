@@ -279,6 +279,33 @@ wait_for_key_dead() {
     return 1
 }
 
+# One-shot poller queries are unreliable for a reason that has nothing to do
+# with the worker: a freshly minted key is refused for the first few seconds
+# while its namespace grant propagates. `up` and `rotate` never notice because
+# wait_for_poller retries. `status` queried once, hid the error, and printed
+# "(none)" — telling the operator the worker was dead when it was polling
+# normally, which is the most misleading thing it could have said.
+#
+# Prints the describe output and returns 0, or prints the last error and
+# returns 1. The caller decides how to present each case; they are not the same
+# result and must not look the same.
+describe_task_queue() {
+    local key="$1" attempts="${2:-10}" out="" attempt
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+        if out="$(temporal task-queue describe \
+            --address "$TEMPORAL_ADDRESS" \
+            --namespace "$TEMPORAL_NAMESPACE" \
+            --api-key "$key" \
+            --task-queue "$TASK_QUEUE" 2>&1)"; then
+            printf '%s\n' "$out"
+            return 0
+        fi
+        sleep 3
+    done
+    printf '%s\n' "$out"
+    return 1
+}
+
 # Proof from outside the worker: Temporal Cloud reports which pollers are
 # attached to the task queue, so the credential is confirmed without trusting
 # the worker's own logs — and without a shell in the image, which distroless has
@@ -516,10 +543,14 @@ cmd_status() {
     }
     key="$TEMP_KEY"
     info "pollers on $TASK_QUEUE:"
-    temporal task-queue describe \
-        --address "$TEMPORAL_ADDRESS" --namespace "$TEMPORAL_NAMESPACE" \
-        --api-key "$key" --task-queue "$TASK_QUEUE" 2>/dev/null |
-        sed 's/^/      /' || info "      (none)"
+    local describe_out
+    if describe_out="$(describe_task_queue "$key")"; then
+        printf '%s\n' "$describe_out" | sed 's/^/      /'
+    else
+        # Deliberately not "(none)". A refused query and an idle task queue are
+        # different facts, and conflating them is what made this command lie.
+        info "      query failed: $(printf '%s' "$describe_out" | head -1)"
+    fi
 }
 
 cmd_logs() {
