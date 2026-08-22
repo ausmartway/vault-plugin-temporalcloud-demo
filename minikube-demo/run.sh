@@ -742,6 +742,26 @@ cmd_status() {
     if minikube status --format '{{.Host}}' 2>/dev/null | grep -q Running; then
         kc get deployment,pod,secret 2>/dev/null | sed 's/^/    /' ||
             info "nothing in $K8S_NAMESPACE"
+
+        # Which of the two credential paths is live. Worth stating outright: the
+        # Secret looks identical either way, so there is otherwise no way to tell
+        # from the output above who is filling it.
+        if kc get vaultdynamicsecret "$SECRET_NAME" >/dev/null 2>&1; then
+            info ""
+            info "credential owner: VSO (pull)"
+            # Conditions, not a `valid` field — VSO 1.5.1 reports health this way.
+            #
+            # LeaseRenewal=False is expected here and not a fault. This role's
+            # ttl equals its max_ttl, so a renewal can never succeed; VSO reads
+            # a new credential instead, which is the behaviour being
+            # demonstrated. Ready and SecretSynced are the ones to read.
+            kc get vaultdynamicsecret "$SECRET_NAME" \
+                -o jsonpath='{range .status.conditions[*]}    {.type}={.status}{"\n"}{end}' 2>/dev/null |
+                sed 's/^/    /' || true
+        else
+            info ""
+            info "credential owner: run.sh (push)"
+        fi
     else
         info "minikube is not running"
     fi
@@ -819,12 +839,60 @@ cmd_watch() {
     done
 }
 
+# Deletes every VSO custom resource, and does not trust their finalizers.
+#
+# All three kinds carry a finalizer that only the operator can clear, so all
+# three must go before the operator does. Deleting the namespace first, or
+# uninstalling VSO first, leaves those finalizers unprocessable and wedges the
+# namespace in Terminating indefinitely — recoverable only by patching the
+# finalizers out by hand.
+#
+# The VaultDynamicSecret is first of the three because its revoke finalizer is
+# the one that asks Vault to delete the key in Temporal Cloud, and that only
+# works while the operator is still running.
+#
+# If the operator has already gone — an interrupted `down`, a manual
+# `helm uninstall` — no finalizer can ever be processed and `kubectl delete`
+# blocks forever. `down` is the command people reach for when things are already
+# broken, so it strips the finalizer instead of hanging.
+remove_vso_resources() {
+    local kind res
+    for kind in vaultdynamicsecret vaultauth vaultconnection; do
+        while read -r res; do
+            [[ -n "$res" ]] || continue
+            if kc delete "$res" --wait --timeout=45s >/dev/null 2>&1; then
+                info "deleted $res"
+            else
+                kc patch "$res" --type=merge \
+                    -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+                kc delete "$res" --ignore-not-found >/dev/null 2>&1 || true
+                info "force-removed $res (finalizer could not be processed)"
+            fi
+        done < <(kc get "$kind" -o name 2>/dev/null || true)
+    done
+}
+
 # Removes only what this script created. minikube itself is left running unless
 # --all is passed: someone running `down` to tidy up after a demo should not
 # lose a cluster they were using for something else.
 cmd_down() {
     say "Removing the Kubernetes resources"
     if minikube status --format '{{.Host}}' 2>/dev/null | grep -q Running; then
+        remove_vso_resources
+
+        if helm status vault-secrets-operator -n "$VSO_NAMESPACE" >/dev/null 2>&1; then
+            helm uninstall vault-secrets-operator -n "$VSO_NAMESPACE" \
+                --wait >/dev/null 2>&1 &&
+                info "uninstalled the Vault Secrets Operator"
+            kubectl delete namespace "$VSO_NAMESPACE" \
+                --ignore-not-found >/dev/null 2>&1
+        fi
+
+        # Cluster-scoped, so deleting the namespace does not remove it.
+        kubectl delete clusterrolebinding temporal-demo-vault-auth-delegator \
+            --ignore-not-found >/dev/null 2>&1 &&
+            info "removed the auth-delegator binding"
+
         kubectl delete namespace "$K8S_NAMESPACE" --ignore-not-found >/dev/null 2>&1 &&
             info "deleted namespace $K8S_NAMESPACE"
         minikube image rm "$IMAGE" >/dev/null 2>&1 && info "removed $IMAGE"
@@ -838,6 +906,25 @@ cmd_down() {
             info "revoked outstanding leases"
         vault delete "$MOUNT/service-accounts/$WORKER_ROLE" >/dev/null 2>&1 &&
             info "deleted $WORKER_ROLE from Vault and Temporal Cloud"
+
+        # Deleting the service account matters more here than revoking leases.
+        # Temporal Cloud issues these keys with a ~24-hour expiry and Vault is
+        # what cuts them short, so if this dev Vault ever restarts with leases
+        # in flight, the keys it was tracking stay valid for a day against a cap
+        # of 20 per service account. At a two-minute cadence that adds up fast.
+        # Deleting the service account removes them all.
+        if vault read "$MOUNT/service-accounts/$WORKER_ROLE_VSO" >/dev/null 2>&1; then
+            vault lease revoke -prefix "$MOUNT/creds/$WORKER_ROLE_VSO" >/dev/null 2>&1 || true
+            vault delete "$MOUNT/service-accounts/$WORKER_ROLE_VSO" >/dev/null 2>&1 &&
+                info "deleted $WORKER_ROLE_VSO and its Temporal Cloud service account"
+        fi
+
+        if vault auth list -format=json 2>/dev/null |
+            jq -e --arg p "$K8S_AUTH_PATH/" 'has($p)' >/dev/null; then
+            vault auth disable "$K8S_AUTH_PATH" >/dev/null 2>&1 &&
+                info "disabled auth/$K8S_AUTH_PATH"
+            vault policy delete "$K8S_AUTH_POLICY" >/dev/null 2>&1 || true
+        fi
     else
         info "Vault is not running — leases will expire on their own"
     fi
