@@ -6,8 +6,10 @@ that HashiCorp Vault issued minutes ago and will delete when its lease ends.
 
 ```bash
 ./run.sh up          # Vault, minikube, the image, the worker
+./run.sh up --vso    # the same, with the Vault Secrets Operator syncing the key
 ./run.sh transfer    # start one money transfer
 ./run.sh rotate      # replace the worker's key without restarting it
+./run.sh watch       # watch VSO replace the credential, live
 ./run.sh down        # remove everything this created
 ```
 
@@ -40,13 +42,87 @@ That callback runs on every request. Point it at a file, mount a Kubernetes
 Secret at that path, and the credential becomes something Vault can replace
 underneath a process that never stops.
 
-| | API key in a Secret | This demo |
-|---|---|---|
-| Key lifetime | Until someone rotates it | The Vault lease (10 minutes) |
-| Rotation | Edit the Secret, restart the pods | `./run.sh rotate`, no restart |
-| Who can use it | Anyone with Secret read access, forever | Whoever holds an unexpired lease |
-| On leak | Valid until noticed and revoked | Dead at the end of the current TTL |
-| Worker downtime to rotate | One rollout | None |
+| | API key in a Secret | `./run.sh up` | `./run.sh up --vso` |
+|---|---|---|---|
+| Key lifetime | Until someone rotates it | The Vault lease (10 minutes) | The Vault lease (2 minutes) |
+| Rotation | Edit the Secret, restart the pods | `./run.sh rotate`, no restart | Automatic, no restart |
+| Who rotates it | A person, if they remember | You, on demand | The operator, on schedule |
+| Who can use it | Anyone with Secret read access, forever | Whoever holds an unexpired lease | Whoever holds an unexpired lease |
+| On leak | Valid until noticed and revoked | Dead at the end of the current TTL | Dead at the end of the current TTL |
+| Worker downtime to rotate | One rollout | None | None |
+| Credential held on your laptop | The one you pasted in | A Vault root token | None |
+
+---
+
+## Two credential paths
+
+The demo runs the same worker two ways, and the difference is only in who puts
+the credential into Kubernetes.
+
+**Push mode**, `./run.sh up`, is the proof. The script reads a key from Vault and
+writes the Secret itself, which means you can revoke a specific lease by hand and
+watch what happens next. `./run.sh rotate` does exactly that: it deletes the key
+the worker booted with, confirms Temporal Cloud genuinely rejects it, and only
+then reports that the same pod is still polling. A person has to drive it, and
+that is the point — the claim is falsifiable.
+
+**Pull mode**, `./run.sh up --vso`, is the production shape. The
+[Vault Secrets Operator](https://developer.hashicorp.com/vault/docs/platform/k8s/vso)
+runs in the cluster, authenticates to Vault with its own ServiceAccount token,
+and keeps the Secret filled on the lease's schedule. Nothing on your laptop holds
+a credential. There is no command to run: the rotation happens on its own, and
+`./run.sh watch` shows it.
+
+Both modes write the same Secret, so `k8s/worker.yaml`, the image, and every line
+of Go are identical either way. The worker cannot tell which mode it runs under.
+That is the claim worth making: application code does not participate in the
+credential lifecycle at all.
+
+To see which mode is live, run `./run.sh status` and read the `credential owner`
+line. Switching modes hands the Secret over explicitly, because the operator and
+`kubectl apply` otherwise contend for ownership of it.
+
+### How VSO authenticates
+
+VSO sends the `vso-temporal` ServiceAccount's token to Vault. Vault verifies that
+token against the cluster's own TokenReview API and returns a short-lived Vault
+token whose policy allows one action: read
+`temporalcloud/creds/demo-k8s-worker-vso`. No long-lived Vault credential exists
+in the cluster.
+
+Vault runs outside the cluster here, which has two consequences that cost real
+debugging time:
+
+- Vault needs a token reviewer of its own, because it has no in-cluster
+  ServiceAccount token to authenticate its TokenReview calls with. That is the
+  `vault-auth` ServiceAccount and its `system:auth-delegator` binding in
+  `k8s/vso/rbac.yaml`. Its token comes from an explicit Secret, because
+  Kubernetes stopped creating those automatically in 1.24 and
+  `kubectl create token` returns one the API server expires.
+- Vault must reach the API server at the minikube container's own address,
+  `https://$(minikube ip):8443`. The address in your kubeconfig is a
+  host-forwarded `127.0.0.1` port, and inside the Vault container `127.0.0.1` is
+  the container itself. Using it fails in a way that looks like a bad token.
+
+### What VSO does not do
+
+`rolloutRestartTargets` is absent from `k8s/vso/dynamic-secret.yaml` on purpose.
+VSO offers that field for applications that cannot pick up a rotated credential
+without restarting. This worker re-reads its key on every request, so restarting
+the pod is the exact thing the demo disproves. Setting the field leaves the demo
+working and proving nothing.
+
+`revoke` fires when you delete the `VaultDynamicSecret`, not on every rotation.
+A lease VSO rotates away from expires on Vault's own timer instead of being
+revoked. With `ttl` equal to `max_ttl` that arrives two minutes after issue, so
+the effect is the same.
+
+Temporal Cloud issues these keys with an expiry about 24 hours out regardless of
+the lease. The short lifetime comes from Vault *deleting* the key when the lease
+ends, not from the key expiring. So if this dev-mode Vault restarts while leases
+are outstanding, it forgets them and those keys stay valid for a day, against a
+cap of 20 per service account. `./run.sh down` deletes the service account for
+that reason.
 
 ---
 
@@ -114,19 +190,20 @@ window is a property of Kubernetes, not of Vault or Temporal.
 
 ### The 10-minute clock
 
-Nothing in this demo renews the worker's lease, so read this before running it in
-front of anyone.
+This applies to push mode only. Nothing there renews the worker's lease, so read
+this before running it in front of anyone. In `--vso` mode the operator keeps the
+credential current and there is no clock to run out.
 
 The lease TTL is 10 minutes. When it expires, Vault deletes that key in Temporal
 Cloud exactly as `rotate` does deliberately — but no replacement arrives, so the
 worker's requests start failing and stay that way. Run `./run.sh rotate` (or
 `up`) to hand it a fresh key.
 
-That is the honest shape of a demo that rotates by hand. A production deployment
-closes the loop with the Vault Secrets Operator or the Agent Injector, which
-renew or reissue on the lease's own schedule; see [What this is
-not](#what-this-is-not). The worker code needs no change for either, because it
-already re-reads its credential on every request.
+That is the honest shape of a demo that rotates by hand. To close the loop, run
+`./run.sh up --vso` and let the Vault Secrets Operator reissue on the lease's own
+schedule; for more information, see [Two credential
+paths](#two-credential-paths). The worker code needs no change for either,
+because it already re-reads its credential on every request.
 
 The lease is renewable, so keeping the same key alive is also an option — up to
 `max_ttl`, and never past the key's own Temporal Cloud expiry, which plugin
@@ -147,6 +224,7 @@ Everything the parent demo needs, plus:
 | `kubectl` | Applies the manifest and reads pod state. |
 | `go` | Builds the starter, which runs on your laptop rather than in the cluster. |
 | `temporal` | Reads the task-queue pollers — the independent evidence. |
+| `helm` | Installs the Vault Secrets Operator for `up --vso`. |
 
 Your `.env` in the parent directory supplies everything else. The regional gRPC
 endpoint is read from your account with `tcld namespace get`, not hardcoded,
@@ -223,11 +301,17 @@ logic, and the diff is the argument for that.
 
 ## Layout
 
-```
+```text
 minikube-demo/
-  run.sh              up | transfer | rotate | status | logs | down
+  run.sh              up [--vso] | transfer | rotate | status | logs | watch | down
   Dockerfile          multi-stage; distroless, non-root, static binary
-  k8s/worker.yaml     ConfigMap + Deployment. No Secret — run.sh creates that.
+  k8s/
+    worker.yaml       ConfigMap + Deployment. No Secret — run.sh or VSO makes that.
+    vso/
+      rbac.yaml              the two ServiceAccounts and the auth-delegator binding
+      vault-connection.yaml  how VSO reaches Vault
+      vault-auth.yaml        how VSO proves who it is
+      dynamic-secret.yaml    the credential VSO keeps in sync
   app/
     workflow.go       upstream, unchanged  <- the exhibit
     activity.go       upstream, unchanged
@@ -274,6 +358,36 @@ to rebuild and reload.
 **A transfer stops responding** — no worker is polling. Check `./run.sh status` for a
 poller on `TRANSFER_MONEY_TASK_QUEUE`.
 
+**`LeaseRenewal=False` in `./run.sh status`** — expected, not a fault. The VSO
+role's `ttl` equals its `max_ttl`, so no renewal can ever succeed and VSO reads a
+new credential instead. Read `Ready` and `SecretSynced` instead.
+
+**`Ready=False` on the `VaultDynamicSecret`** — read the operator log:
+
+```bash
+kubectl logs -l app.kubernetes.io/name=vault-secrets-operator \
+    -n vault-secrets-operator-system --tail=50
+```
+
+A connection error means Vault cannot reach the API server, so check
+`kubernetes_host`. A `permission denied` means the token reviewer is wrong, not
+the policy.
+
+**The pod reports `CreateContainerConfigError` in VSO mode** — the Secret's data
+key is not `api_key`. Both modes write `api_key` with an underscore, matching the
+field name the Vault plugin returns, and `k8s/worker.yaml` mounts it as the file
+`api-key`.
+
+**`./run.sh down` leaves the namespace in `Terminating`** — a VSO custom resource
+still holds a finalizer that no operator is left to clear. `down` deletes all
+three kinds before uninstalling the operator, and strips a finalizer it cannot
+get processed, so this should not happen. To clear it by hand:
+
+```bash
+kubectl patch vaultauth temporal-vault-auth -n temporal-demo \
+    --type=merge -p '{"metadata":{"finalizers":[]}}'
+```
+
 **`./run.sh down` left minikube running** — deliberate. It removes only what
 this demo created, because someone tidying up after a meeting should not lose a
 cluster they were using for something else. `./run.sh down --all` stops minikube
@@ -287,16 +401,24 @@ Dev-mode Vault, a root token in a file, and a bootstrap credential pasted in by
 hand — the same caveats as the parent demo. The rotation mechanism is
 production-shaped; this deployment is not.
 
-A production version replaces the script's `vault read` with something inside
-the cluster:
+`./run.sh up --vso` closes two of those gaps. VSO refreshes the Secret from
+inside the cluster on the lease's own schedule, and it authenticates with
+Kubernetes auth rather than a root token, so no credential of yours is involved
+in the rotation.
 
-- The [Vault Secrets Operator](https://developer.hashicorp.com/vault/docs/platform/k8s/vso)
-  or [Vault Agent Injector](https://developer.hashicorp.com/vault/docs/platform/k8s/injector),
-  so Vault refreshes the Secret on the lease's own schedule rather than waiting
-  for someone to run a script.
-- Kubernetes auth instead of a root token, so the pod authenticates to Vault
-  with its ServiceAccount token and no operator credential is involved.
+What stays unlike production in either mode:
 
-Both are the same mechanism this demo shows by hand. The worker code does not
-change: it already reads its credential from a file on every request, which is
-all either of those needs.
+- **Vault runs in `-dev`.** In memory, auto-unsealed, one known root token. A
+  restart loses every lease, which is why `down` deletes the service account
+  rather than trusting revocation.
+- **`run.sh` still configures Vault with the root token.** Enabling the auth
+  mount, writing the policy, and creating the roles are operator actions here.
+  In production they are Terraform, run once, by someone else.
+- **The bootstrap Temporal Cloud credential is pasted in by hand**, the same
+  caveat as the parent demo.
+- **One replica, one namespace, no TLS to Vault.**
+
+The [Vault Agent Injector](https://developer.hashicorp.com/vault/docs/platform/k8s/injector)
+is the other way to do what VSO does here, and it needs no worker change either.
+The worker already reads its credential from a file on every request, which is
+all any of these approaches requires.
