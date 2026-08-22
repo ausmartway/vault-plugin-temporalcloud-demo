@@ -171,6 +171,22 @@ vault_role_vso() {
     fi
 }
 
+# Prints whichever role currently exists, preferring the push-mode one.
+#
+# `transfer` and `status` both need a credential of their own to talk to Temporal
+# Cloud with, and which role can supply it depends on how the demo was brought
+# up: a checkout driven only with `up --vso` never creates the push-mode role, so
+# naming it outright makes those commands fail on a demo that is working fine.
+available_role() {
+    if vault read "$MOUNT/service-accounts/$WORKER_ROLE" >/dev/null 2>&1; then
+        printf '%s\n' "$WORKER_ROLE"
+    elif vault read "$MOUNT/service-accounts/$WORKER_ROLE_VSO" >/dev/null 2>&1; then
+        printf '%s\n' "$WORKER_ROLE_VSO"
+    else
+        fail "no Vault role exists — run './run.sh up' or './run.sh up --vso' first"
+    fi
+}
+
 vault_k8s_auth() {
     say "Vault Kubernetes auth"
 
@@ -617,10 +633,11 @@ cmd_transfer() {
     say "Starting a transfer"
     # A short-lived credential for a short-lived process. This one is thrown
     # away when the transfer finishes; it is not the worker's key.
-    local key
-    mint_temp_key "$WORKER_ROLE"
+    local key role
+    role="$(available_role)"
+    mint_temp_key "$role"
     key="$TEMP_KEY"
-    info "minted a starter credential from $MOUNT/creds/$WORKER_ROLE"
+    info "minted a starter credential from $MOUNT/creds/$role"
     (
         cd "$DEMO_DIR/app" &&
             TEMPORAL_ADDRESS="$TEMPORAL_ADDRESS" \
@@ -768,8 +785,12 @@ cmd_status() {
 
     say "Temporal Cloud"
     info "namespace $TEMPORAL_NAMESPACE at $TEMPORAL_ADDRESS"
-    local key
-    mint_temp_key "$WORKER_ROLE" 2>/dev/null || {
+    local key role
+    role="$(available_role 2>/dev/null)" || {
+        info "(no Vault role exists yet, so there is nothing to query with)"
+        return 0
+    }
+    mint_temp_key "$role" 2>/dev/null || {
         info "(could not mint a key to query with)"
         return 0
     }
