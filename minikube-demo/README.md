@@ -5,11 +5,10 @@ running as a Kubernetes Deployment, connected to Temporal Cloud with an API key
 that HashiCorp Vault issued minutes ago and will delete when its lease ends.
 
 ```bash
-./run.sh up          # Vault, minikube, the image, the worker
-./run.sh up --vso    # the same, with the Vault Secrets Operator syncing the key
+./run.sh up          # Vault, VSO, minikube, the image, and the worker
 ./run.sh transfer    # start one money transfer
-./run.sh rotate      # replace the worker's key without restarting it
 ./run.sh watch       # watch VSO replace the credential, live
+./run.sh status      # inspect Vault, VSO, Kubernetes, and Temporal Cloud
 ./run.sh down        # remove everything this created
 ```
 
@@ -42,45 +41,49 @@ That callback runs on every request. Point it at a file, mount a Kubernetes
 Secret at that path, and the credential becomes something Vault can replace
 underneath a process that never stops.
 
-| | API key in a Secret | `./run.sh up` | `./run.sh up --vso` |
-|---|---|---|---|
-| Key lifetime | Until someone rotates it | The Vault lease (10 minutes) | The Vault lease (2 minutes) |
-| Rotation | Edit the Secret, restart the pods | `./run.sh rotate`, no restart | Automatic, no restart |
-| Who rotates it | A person, if they remember | You, on demand | The operator, on schedule |
-| Who can use it | Anyone with Secret read access, forever | Whoever holds an unexpired lease | Whoever holds an unexpired lease |
-| On leak | Valid until noticed and revoked | Dead at the end of the current TTL | Dead at the end of the current TTL |
-| Worker downtime to rotate | One rollout | None | None |
-| Credential held on your laptop | The one you pasted in | A Vault root token | None |
+| | Static API key in a Secret | This VSO demo |
+|---|---|---|
+| Key lifetime | Until someone rotates it | The Vault lease (2 minutes) |
+| Rotation | Manual Secret update, often followed by a rollout | Automatic and lease-driven |
+| Credential owner | A person or deployment script | Vault Secrets Operator |
+| On leak | Valid until noticed and revoked | Deleted when its Vault lease ends |
+| Worker downtime to rotate | Commonly one rollout | None |
+| Worker API key handled by `run.sh` | Usually | Never |
 
 ---
 
-## Two credential paths
+## The VSO credential path
 
-The demo runs the same worker two ways, and the difference is only in who puts
-the credential into Kubernetes.
-
-**Push mode**, `./run.sh up`, is the proof. The script reads a key from Vault and
-writes the Secret itself, which means you can revoke a specific lease by hand and
-watch what happens next. `./run.sh rotate` does exactly that: it deletes the key
-the worker booted with, confirms Temporal Cloud genuinely rejects it, and only
-then reports that the same pod is still polling. A person has to drive it, and
-that is the point — the claim is falsifiable.
-
-**Pull mode**, `./run.sh up --vso`, is the production shape. The
+The Kubernetes demo has one credential-delivery path. The
 [Vault Secrets Operator](https://developer.hashicorp.com/vault/docs/platform/k8s/vso)
-runs in the cluster, authenticates to Vault with its own ServiceAccount token,
-and keeps the Secret filled on the lease's schedule. Nothing on your laptop holds
-a credential. There is no command to run: the rotation happens on its own, and
-`./run.sh watch` shows it.
+runs in the cluster, authenticates to Vault with Kubernetes auth, reads the
+dynamic secret, and owns `Secret/temporal-api-key`:
 
-Both modes write the same Secret, so `k8s/worker.yaml`, the image, and every line
-of Go are identical either way. The worker cannot tell which mode it runs under.
-That is the claim worth making: application code does not participate in the
-credential lifecycle at all.
+```text
+Vault dynamic secret
+        │  leased API key
+        ▼
+VaultDynamicSecret ──VSO──► Kubernetes Secret
+                                    │ mounted file
+                                    ▼
+                          Temporal Worker callback
+```
 
-To see which mode is live, run `./run.sh status` and read the `credential owner`
-line. Switching modes hands the Secret over explicitly, because the operator and
-`kubectl apply` otherwise contend for ownership of it.
+`run.sh` configures this path but never reads or writes the Worker's API key.
+The only credentials it mints are temporary keys for the laptop-side workflow
+starter and for independent Temporal Cloud poller queries; each is revoked when
+the command exits.
+
+The VSO resource reads `temporalcloud/creds/demo-k8s-worker-vso`. Its Vault role
+uses `ttl=2m` and `max_ttl=2m`, so the lease cannot be extended. VSO must read a
+new dynamic secret, write the new API key to its destination Secret, and let the
+old lease expire. The Worker reads the mounted file through the Temporal SDK's
+dynamic-credentials callback, so it uses the refreshed value without a rollout.
+
+Run `./run.sh status` to see the `VaultDynamicSecret` conditions and confirm that
+VSO is the credential owner. Run `./run.sh watch` to see the Secret's
+`resourceVersion` change while the pod name and restart count stay stable. The
+command never reads the Secret's data.
 
 ### How VSO authenticates
 
@@ -130,87 +133,62 @@ that reason.
 
 1. **Starts Vault** and mounts the Temporal Cloud secrets engine, registering
    the plugin by its binary's SHA256.
-2. **Creates a Vault role** — `demo-k8s-worker`, with account-level read and
-   *write* on your namespace. Write is what lets a worker poll a task queue and
-   complete tasks. Its own role, not one `demo.sh` created, so `make reset` in
-   the parent directory cannot delete the worker's credential mid-demo.
+2. **Creates the VSO Vault role** — `demo-k8s-worker-vso`, with account-level
+   read and *write* on your namespace. Write is what lets a Worker poll a task
+   queue and complete tasks. The role uses a two-minute, non-extendable lease.
 3. **Starts minikube** and creates the `temporal-demo` namespace.
 4. **Builds the worker image** with the host Docker daemon, then side-loads it
    with `minikube image load`. No registry involved.
-5. **Mints an API key** and writes it to `secret/temporal-api-key`. The key
-   exists only in Vault and in the cluster — never in this repo.
-6. **Applies the Deployment** and waits for the rollout.
-7. **Confirms the worker authenticated** by asking Temporal Cloud which pollers
-   are attached to the task queue. The evidence comes from Temporal Cloud, not
-   from the worker's own logs.
+5. **Installs VSO** at the pinned chart version and configures Vault Kubernetes
+   auth for the `vso-temporal` ServiceAccount.
+6. **Applies `VaultConnection`, `VaultAuth`, and `VaultDynamicSecret`**. VSO
+   reads the dynamic secret and creates `Secret/temporal-api-key`; `run.sh`
+   never handles the Worker's API key.
+7. **Applies the Deployment** and waits for the rollout.
+8. **Checks Temporal Cloud's task-queue pollers** for the current pod. This
+   verification is performed externally by `run.sh`; the Worker does not report
+   or confirm which credential it is using.
 
 Then `./run.sh transfer` starts a transfer from your laptop, and the worker in
 the cluster executes it.
 
 ---
 
-## The rotation, and why it proves something
+## Automatic rotation
 
-`./run.sh rotate` is the part worth watching:
+There is no `rotate` command. The lease is the clock and VSO is the controller:
 
-1. Records the worker's pod name and restart count, and reads back the key the
-   worker is holding.
-2. Mints a **new** key from Vault and writes it over the Secret.
-3. **Revokes the lease on the old key**, which deletes that key in Temporal
-   Cloud.
-4. **Confirms the old key is genuinely rejected**, by trying to use it until it
-   fails three times in a row.
-5. Waits for Temporal Cloud to report the *same pod* polling, with a timestamp
-   later than step 4.
-6. Prints the pod name and restart count a second time.
+1. VSO authenticates to Vault with the `vso-temporal` ServiceAccount.
+2. VSO reads `temporalcloud/creds/demo-k8s-worker-vso` and receives a leased API
+   key.
+3. VSO writes the API key to `Secret/temporal-api-key`.
+4. At the lease boundary, VSO reads a new dynamic secret and updates the
+   destination Secret. Vault deletes the older Temporal Cloud API key when its
+   lease expires.
+5. kubelet refreshes the projected Secret volume and the SDK callback reads the
+   new file value on a subsequent request.
 
-Step 4 is not ceremony. Deleting a key reaches Temporal Cloud's auth layer a few
-seconds after Vault returns, so for a moment the deleted key still works — and a
-poll observed in that window would prove nothing. Without step 4 the whole
-demonstration passes in three seconds and means nothing, which is exactly what
-it did before the check was added.
+Run `./run.sh watch`. It prints the Kubernetes Secret's `resourceVersion` beside
+the pod name and restart count, without reading the Secret's data. Every 60–70
+seconds the resource version changes; the pod identity and restart count should
+not. This demonstrates VSO updating the destination Secret without a rollout.
+It does not claim that the Worker itself reports which key version it is
+using—the Worker has no such reporting behaviour.
 
-Step 5 is specific for the same reason. Temporal Cloud keeps reporting pollers
-for minutes after the process behind them is gone, so the check matches the
-identity of the pod running *now* and ignores any poll recorded before step 4
-finished.
+The rotation happens well inside the two-minute lease on purpose, and the reason
+is kubelet rather than Vault. Vault deletes the old Temporal Cloud key the
+instant its lease expires, while kubelet refreshes a mounted Secret only on its
+own sync cycle — up to a minute. The gap between VSO writing the new key and
+Vault deleting the old one is the budget kubelet has to project it into the
+pod; run out of budget and the Worker is holding a key that no longer exists,
+which it reports as `Request unauthorized` until the file catches up.
 
-What is left is a chain with no other explanation: the key the worker booted with
-is provably dead, the pod that is provably still the same process polled
-successfully after that, and its restart count never moved.
-
-The script claims this only when both values match. If the pod did restart it
-reports that instead and exits non-zero — a rotation that needed a restart is a
-weaker claim, and worth making honestly.
-
-**This takes up to about a minute.** kubelet refreshes a mounted Secret on its
-sync interval rather than immediately, so there is a window where the worker's
-requests fail with `Unauthenticated` and the SDK's retry carries it across. That
-window is a property of Kubernetes, not of Vault or Temporal.
-
-### The 10-minute clock
-
-This applies to push mode only. Nothing there renews the worker's lease, so read
-this before running it in front of anyone. In `--vso` mode the operator keeps the
-credential current and there is no clock to run out.
-
-The lease TTL is 10 minutes. When it expires, Vault deletes that key in Temporal
-Cloud exactly as `rotate` does deliberately — but no replacement arrives, so the
-worker's requests start failing and stay that way. Run `./run.sh rotate` (or
-`up`) to hand it a fresh key.
-
-That is the honest shape of a demo that rotates by hand. To close the loop, run
-`./run.sh up --vso` and let the Vault Secrets Operator reissue on the lease's own
-schedule; for more information, see [Two credential
-paths](#two-credential-paths). The worker code needs no change for either,
-because it already re-reads its credential on every request.
-
-The lease is renewable, so keeping the same key alive is also an option — up to
-`max_ttl`, and never past the key's own Temporal Cloud expiry, which plugin
-0.1.1 clamps renewal to.
-
-Ten minutes is deliberate. A TTL long enough to outlast a meeting would let the
-demo finish without ever proving the mechanism.
+`renewalPercent: 25` in `k8s/vso/dynamic-secret.yaml` is what buys that
+budget — about 54 seconds of it, measured. At the 90% this demo used
+previously the budget was ~12 seconds, and every rotation produced a burst of
+refused polls; the SDK retried through them without restarting, but the backoff
+was enough to stall an in-flight transfer for a minute. That file records the
+measurements behind the number.
 
 ---
 
@@ -224,7 +202,7 @@ Everything the parent demo needs, plus:
 | `kubectl` | Applies the manifest and reads pod state. |
 | `go` | Builds the starter, which runs on your laptop rather than in the cluster. |
 | `temporal` | Reads the task-queue pollers — the independent evidence. |
-| `helm` | Installs the Vault Secrets Operator for `up --vso`. |
+| `helm` | Installs the Vault Secrets Operator during `up`. |
 
 Your `.env` in the parent directory supplies everything else. The regional gRPC
 endpoint is read from your account with `tcld namespace get`, not hardcoded,
@@ -246,10 +224,20 @@ Both cost real debugging time here, and neither is obvious from the outside.
 propagates to the data plane before namespace write does. The visible effect is a
 credential that connects successfully and is then refused when it tries to do
 anything: `client.Dial` returns a working client, and the worker's first poll
-comes back `Request unauthorized`. Retrying is the only fix, and it has to wrap
-the *first poll*, not just the dial. Protecting only the dial produces a worker
-that exits, gets restarted by Kubernetes, and comes up whenever the grant happens
-to land — a crash loop wearing a startup delay as a disguise.
+comes back `Request unauthorized`.
+
+The plugin closes that window itself now. This role is created with
+`verify_propagation=true`, and `temporalcloud/config/probe` sets the policy for
+the mount: plugin 0.3.0 opens ten independent connections to the namespace
+frontend, 50ms apart, and only returns the key once all ten succeed. The wait
+happens inside `vault read creds/…` — before anything in the cluster ever
+sees the credential.
+
+The worker still retries, and the retry still has to wrap the *first poll*, not
+just the dial. That matters if you ever mint a key without the probe: protecting
+only the dial produces a worker that exits, gets restarted by Kubernetes, and
+comes up whenever the grant happens to land — a crash loop wearing a startup
+delay as a disguise.
 
 **`serviceerror.PermissionDenied` is invisible to `status.Code()`.** It carries
 its gRPC status on a method called `Status()`, while `status.FromError` looks for
@@ -303,10 +291,10 @@ logic, and the diff is the argument for that.
 
 ```text
 minikube-demo/
-  run.sh              up [--vso] | transfer | rotate | status | logs | watch | down
+  run.sh              up | transfer | status | logs | watch | down
   Dockerfile          multi-stage; distroless, non-root, static binary
   k8s/
-    worker.yaml       ConfigMap + Deployment. No Secret — run.sh or VSO makes that.
+    worker.yaml       ConfigMap + Deployment. No Secret — VSO creates that.
     vso/
       rbac.yaml              the two ServiceAccounts and the auth-delegator binding
       vault-connection.yaml  how VSO reaches Vault
@@ -322,29 +310,27 @@ minikube-demo/
     LICENSE           upstream MIT license, kept with the code it covers
 ```
 
-`run.sh` creates the Secret from `vault read`, and it is deliberately absent
-from `k8s/`. Applying `k8s/worker.yaml` on its own leaves the pod waiting for a
-credential that does not exist, which is the correct behaviour for a manifest
+`dynamic-secret.yaml` declares the destination Secret, and VSO creates and
+updates it from Vault. The Secret itself is deliberately absent from `k8s/`.
+Applying `k8s/worker.yaml` without the VSO resources leaves the pod waiting for
+a credential that does not exist, which is the correct behaviour for a manifest
 that holds no secret.
 
 ---
 
 ## Troubleshooting
 
-**The pod logs `Temporal Cloud refused the credential (attempt 1/30)`** —
-expected for the first few seconds after a role is created, and the worker
-retries out of it without restarting. See the preceding propagation note. If it runs
-past ~90s the key is genuinely being rejected: check that your namespace reports
-`authMethod: ApiKey`.
+**The pod logs `Temporal Cloud refused the credential (attempt 1/30)`** — no
+longer expected, since the plugin verifies the namespace grant before returning
+the key (see the preceding propagation note). One or two on the way past is the
+retry doing its job. A run of them means the probe is not covering this path:
+check that the role actually has `verify_propagation=true`
+(`vault read temporalcloud/service-accounts/demo-k8s-worker-vso`) and that your
+namespace reports `authMethod: ApiKey`.
 
 **`no poller appeared`** — the worker is running but never authenticated. Run
 `./run.sh logs`. If it is still printing `refused the credential`, the namespace
-grant has not propagated; anything else is a real error.
-
-**`the old key still authenticates`** during `rotate` — the deletion has not
-reached the auth layer within two minutes, which is longer than expected. The
-rotation itself is fine; the script refuses to claim a result it cannot yet
-prove. Run `rotate` again.
+grant has not propagated despite the probe; anything else is a real error.
 
 **`too many API keys`** — Temporal Cloud caps a service account at 20 non-expired
 keys. `run.sh` revokes the short-lived credentials it mints for the starter and
@@ -373,10 +359,10 @@ A connection error means Vault cannot reach the API server, so check
 `kubernetes_host`. A `permission denied` means the token reviewer is wrong, not
 the policy.
 
-**The pod reports `CreateContainerConfigError` in VSO mode** — the Secret's data
-key is not `api_key`. Both modes write `api_key` with an underscore, matching the
-field name the Vault plugin returns, and `k8s/worker.yaml` mounts it as the file
-`api-key`.
+**The pod reports `CreateContainerConfigError`** — first check whether
+`VaultDynamicSecret/temporal-api-key` is `Ready`. The destination Secret must
+contain `api_key` with an underscore, matching the field name the Vault plugin
+returns; `k8s/worker.yaml` mounts it as the file `api-key`.
 
 **`./run.sh down` leaves the namespace in `Terminating`** — a VSO custom resource
 still holds a finalizer that no operator is left to clear. `down` deletes all
@@ -401,12 +387,11 @@ Dev-mode Vault, a root token in a file, and a bootstrap credential pasted in by
 hand — the same caveats as the parent demo. The rotation mechanism is
 production-shaped; this deployment is not.
 
-`./run.sh up --vso` closes two of those gaps. VSO refreshes the Secret from
-inside the cluster on the lease's own schedule, and it authenticates with
-Kubernetes auth rather than a root token, so no credential of yours is involved
-in the rotation.
+VSO refreshes the Secret from inside the cluster on the lease's own schedule and
+authenticates with Kubernetes auth rather than a long-lived Vault token. The
+root token is used by `run.sh` only to configure this dev environment.
 
-What stays unlike production in either mode:
+What stays unlike production:
 
 - **Vault runs in `-dev`.** In memory, auto-unsealed, one known root token. A
   restart loses every lease, which is why `down` deletes the service account
@@ -417,8 +402,3 @@ What stays unlike production in either mode:
 - **The bootstrap Temporal Cloud credential is pasted in by hand**, the same
   caveat as the parent demo.
 - **One replica, one namespace, no TLS to Vault.**
-
-The [Vault Agent Injector](https://developer.hashicorp.com/vault/docs/platform/k8s/injector)
-is the other way to do what VSO does here, and it needs no worker change either.
-The worker already reads its credential from a file on every request, which is
-all any of these approaches requires.

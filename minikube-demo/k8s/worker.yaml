@@ -1,10 +1,10 @@
 # The money-transfer worker, connected to Temporal Cloud with a Vault-issued
 # API key.
 #
-# The Secret this mounts is not in this file, and not in this repo: run.sh
-# creates it from `vault read`, so the credential never exists in git. Applying
-# this manifest without run.sh leaves the pod waiting for a credential, which is
-# the correct failure.
+# The Secret this mounts is not in this file, and not in this repo. VSO creates
+# it from a VaultDynamicSecret, so the credential never exists in git or passes
+# through run.sh. Applying this manifest without the VSO resources leaves the
+# pod waiting for a credential, which is the correct failure.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -74,6 +74,6 @@ spec:
               # volume. They differ on purpose: api_key matches the field the
               # Vault plugin returns (and therefore what VSO writes), while
               # api-key keeps the worker reading /vault/creds/api-key exactly as
-              # before. No Go code changes for either credential path.
+              # before. The Worker never participates in VSO's lease lifecycle.
               - key: api_key
                 path: api-key

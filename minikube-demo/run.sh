@@ -3,12 +3,11 @@
 # A Temporal worker in Kubernetes, holding an API key that Vault issued and
 # will delete when its lease ends.
 #
-#   ./run.sh up        bring up Vault, minikube, the image and the worker
-#   ./run.sh up --vso  the same, but the Vault Secrets Operator syncs the key
+#   ./run.sh up        bring up Vault, VSO, minikube, the image and the worker
 #   ./run.sh transfer  start one money transfer from this laptop
-#   ./run.sh rotate    replace the worker's key without restarting the pod
 #   ./run.sh status    what exists right now, on all three sides
 #   ./run.sh watch     watch VSO replace the credential, live
+#   ./run.sh logs      read the worker's logs
 #   ./run.sh down      remove everything this script created
 #
 # The argument: a long-running worker and a credential measured in minutes are
@@ -29,26 +28,16 @@ SECRET_NAME="temporal-api-key"
 DEPLOYMENT="money-transfer-worker"
 TASK_QUEUE="TRANSFER_MONEY_TASK_QUEUE"
 
-# The worker's Vault role. Its own, not one demo.sh created: this demo has to
-# stand up on a clean checkout without the other one having been run, and
-# `make reset` must not delete the worker's credential out from under it.
-#
-# ttl/max_ttl are deliberately short. A worker that only survives because its
-# credential outlasts the meeting proves nothing; these values guarantee at
-# least one rotation happens while anyone is watching.
-WORKER_ROLE="demo-k8s-worker"
-WORKER_TTL="10m"
-WORKER_MAX_TTL="1h"
+# The worker's Vault role is dedicated to VSO. ttl == max_ttl is the point:
+# renewal can never extend a lease, so VSO must mint a genuinely new Temporal
+# Cloud API key every couple of minutes instead of keeping one key alive.
+WORKER_ROLE="demo-k8s-worker-vso"
+WORKER_TTL="2m"
 
-# The VSO path gets its own role, so the manual path's timings are untouched
-# and either mode can be torn down without disturbing the other.
-#
-# ttl == max_ttl is the whole point. Renewal can never extend a lease past
-# max_ttl, so VSO cannot keep one key alive — it has to mint a genuinely new
-# credential every couple of minutes. A longer max_ttl would have VSO quietly
-# renewing the same key for an hour, which demonstrates nothing in a meeting.
-WORKER_ROLE_VSO="demo-k8s-worker-vso"
-VSO_TTL="2m"
+# Older versions of this demo had a script-managed Secret path under this role.
+# `down` still removes it so a checkout upgraded in place can be cleaned fully;
+# no current command reads credentials from it or writes them into Kubernetes.
+LEGACY_WORKER_ROLE="demo-k8s-worker"
 
 # Kubernetes auth, so nothing in the cluster holds a long-lived Vault
 # credential. VSO presents its ServiceAccount token; Vault verifies it with the
@@ -137,54 +126,70 @@ vault_up() {
             admin_service_account_id="$TEMPORAL_ADMIN_SA_ID" >/dev/null
         info "bootstrap credential configured"
     fi
+
+    vault write "$MOUNT/config/probe" \
+        interval=50ms consecutive_successes=10 >/dev/null ||
+        fail "could not configure propagation probes"
+    info "propagation probe configured (10 successes, 50ms interval)"
 }
 
 vault_role() {
-    say "Vault role for the worker"
+    say "Vault role for VSO"
     if vault read "$MOUNT/service-accounts/$WORKER_ROLE" >/dev/null 2>&1; then
         info "$WORKER_ROLE already exists"
-    else
-        # account_role=read is this plugin's floor — it requires an account role
-        # on every write. The grant that matters is namespace write, which is
-        # what lets the worker poll a task queue and complete tasks.
-        vault write "$MOUNT/service-accounts/$WORKER_ROLE" \
-            account_role=read \
-            namespace_access="$TEMPORAL_NAMESPACE=write" \
-            ttl="$WORKER_TTL" max_ttl="$WORKER_MAX_TTL" \
-            description='Money-transfer worker in minikube, issued by Vault' >/dev/null
-        info "created $WORKER_ROLE (ttl=$WORKER_TTL, max_ttl=$WORKER_MAX_TTL)"
+        return
     fi
-}
 
-vault_role_vso() {
-    say "Vault role for VSO"
-    if vault read "$MOUNT/service-accounts/$WORKER_ROLE_VSO" >/dev/null 2>&1; then
-        info "$WORKER_ROLE_VSO already exists"
-    else
-        vault write "$MOUNT/service-accounts/$WORKER_ROLE_VSO" \
-            account_role=read \
-            namespace_access="$TEMPORAL_NAMESPACE=write" \
-            ttl="$VSO_TTL" max_ttl="$VSO_TTL" \
-            description='Money-transfer worker, credential synced by VSO' >/dev/null ||
-            fail "could not create $WORKER_ROLE_VSO"
-        info "created $WORKER_ROLE_VSO (ttl=max_ttl=$VSO_TTL)"
+    # Vault runs in dev mode here, so restarting its container wipes every role
+    # while the Temporal Cloud service accounts those roles created live on. The
+    # plugin will not mint against an account it did not create, so without this
+    # `up` fails permanently on a name it created itself — and `up` is the
+    # documented recovery path after a half-finished demo.
+    #
+    # force=true adopts the orphan and resets its permissions to the spec below.
+    # Adoption also makes it fully Vault-managed again, which is what puts it
+    # back within reach of `down`.
+    #
+    # Decided by asking Temporal Cloud rather than by matching the plugin's
+    # error text, which is not an API and changes between versions.
+    local force=false adopted="" existing_id="" out=""
+    existing_id="$(tcld --api-key "$TEMPORAL_API_KEY" service-account list 2>/dev/null |
+        jq -r --arg n "$WORKER_ROLE" \
+            'first(.serviceAccount[]? | select(.spec.name == $n) | .id) // empty')" || true
+    if [[ -n "$existing_id" ]]; then
+        force=true
+        adopted=", adopted from a previous run"
     fi
-}
 
-# Prints whichever role currently exists, preferring the push-mode one.
-#
-# `transfer` and `status` both need a credential of their own to talk to Temporal
-# Cloud with, and which role can supply it depends on how the demo was brought
-# up: a checkout driven only with `up --vso` never creates the push-mode role, so
-# naming it outright makes those commands fail on a demo that is working fine.
-available_role() {
-    if vault read "$MOUNT/service-accounts/$WORKER_ROLE" >/dev/null 2>&1; then
-        printf '%s\n' "$WORKER_ROLE"
-    elif vault read "$MOUNT/service-accounts/$WORKER_ROLE_VSO" >/dev/null 2>&1; then
-        printf '%s\n' "$WORKER_ROLE_VSO"
-    else
-        fail "no Vault role exists — run './run.sh up' or './run.sh up --vso' first"
+    if ! out="$(vault write "$MOUNT/service-accounts/$WORKER_ROLE" \
+        account_role=read \
+        namespace_access="$TEMPORAL_NAMESPACE=write" \
+        verify_propagation=true \
+        force="$force" \
+        ttl="$WORKER_TTL" max_ttl="$WORKER_TTL" \
+        description='Money-transfer worker, credential synced by VSO' 2>&1)"; then
+
+        # Plugin 0.3.0 adopts by issuing UpdateServiceAccount unconditionally,
+        # and Temporal Cloud rejects an update that changes nothing. An orphan
+        # this demo created already matches this spec exactly, so the most
+        # ordinary recovery of all is the one adoption cannot complete. Say so
+        # with the command that fixes it rather than printing a Vault 400 and
+        # leaving the operator to work it out mid-demo.
+        if [[ "$out" == *"nothing to change"* ]]; then
+            printf '\033[1;31mERROR: %s already exists in Temporal Cloud (id %s) with exactly\n' \
+                "$WORKER_ROLE" "$existing_id" >&2
+            printf '  these permissions, and plugin %s cannot adopt an account it has nothing\n' \
+                "$PLUGIN_VERSION" >&2
+            printf '  to change. Delete the orphan and re-run ./run.sh up:\n\n' >&2
+            printf '    tcld --api-key "$TEMPORAL_API_KEY" service-account delete \\\n' >&2
+            printf '      --service-account-id %s\n\033[0m' "$existing_id" >&2
+            exit 1
+        fi
+
+        printf '%s\n' "$out" >&2
+        fail "could not create $WORKER_ROLE"
     fi
+    info "created $WORKER_ROLE (ttl=max_ttl=$WORKER_TTL, propagation verified$adopted)"
 }
 
 vault_k8s_auth() {
@@ -226,10 +231,10 @@ vault_k8s_auth() {
     # Least privilege, and worth reading aloud in a demo: VSO can read exactly
     # one credential path and do nothing else in Vault.
     printf 'path "%s/creds/%s" {\n  capabilities = ["read"]\n}\n' \
-        "$MOUNT" "$WORKER_ROLE_VSO" |
+        "$MOUNT" "$WORKER_ROLE" |
         vault policy write "$K8S_AUTH_POLICY" - >/dev/null ||
         fail "could not write policy $K8S_AUTH_POLICY"
-    info "wrote policy $K8S_AUTH_POLICY (read on $MOUNT/creds/$WORKER_ROLE_VSO)"
+    info "wrote policy $K8S_AUTH_POLICY (read on $MOUNT/creds/$WORKER_ROLE)"
 
     # The audience is set even though Vault 1.20 does not require it: 1.21 makes
     # it mandatory, and a role without one starts failing on a Vault upgrade
@@ -288,9 +293,9 @@ apply_vso_manifests() {
     info "applied rbac, VaultConnection, VaultAuth, VaultDynamicSecret"
 }
 
-# Mints a key and prints "<lease_id> <api_key>". Both halves are needed: the
-# lease is how the caller later revokes exactly the key it issued, which is what
-# makes the rotation proof airtight.
+# Mints a key and prints "<lease_id> <api_key>". This is used only for the
+# short-lived local starter and verification probes. The Worker's credential is
+# read by VSO directly from Vault and is never handled by this script.
 mint_key() {
     local out
     out="$(vault read -format=json "$MOUNT/creds/$1")" ||
@@ -299,11 +304,11 @@ mint_key() {
 }
 
 # A credential for one command — the starter, or a probe that queries Temporal
-# Cloud — as distinct from the long-lived one the worker holds.
+# Cloud — as distinct from the dynamic credential VSO supplies to the Worker.
 #
 # These are revoked on the way out rather than left to expire, because Temporal
 # Cloud caps a service account at 20 non-expired keys and a demo being driven
-# from the keyboard mints them faster than a 10-minute TTL retires them. Without
+# from the keyboard mints them faster than a two-minute TTL retires them. Without
 # this, the twentieth `transfer` fails for a reason that has nothing to do with
 # what is being demonstrated.
 TEMP_LEASES=()
@@ -318,6 +323,12 @@ TEMP_KEY=""
 mint_temp_key() {
     local lease
     read -r lease TEMP_KEY <<<"$(mint_key "$1")"
+    # mint_key's fail() runs inside $(...), so its `exit 1` ends only that
+    # subshell — this function keeps going with an empty key. `read` does not
+    # catch it either: an empty substitution is still a line, so it returns 0.
+    # Testing the value is the only thing that works, and without it the array
+    # append below would make every failure look like a success to the caller.
+    [[ -n "$TEMP_KEY" ]] || return 1
     TEMP_LEASES+=("$lease")
 }
 
@@ -365,25 +376,8 @@ build_image() {
 }
 
 ########################################################################
-# The credential, and the worker that holds it
+# The Worker that consumes VSO's destination Secret
 ########################################################################
-# Writing the Secret through `create --dry-run | apply` rather than `create`
-# makes this idempotent: the same command installs the first key and replaces
-# every later one, which is exactly what `rotate` needs.
-#
-# The data key is api_key with an underscore, matching the field name the Vault
-# plugin returns. VSO names Secret keys after the Vault response fields, so
-# using the same name here means both credential paths produce an identical
-# Secret and the Deployment does not care which one filled it. The mounted
-# filename is still api-key — see the items block in k8s/worker.yaml.
-write_secret() {
-    kubectl create secret generic "$SECRET_NAME" \
-        --namespace "$K8S_NAMESPACE" \
-        --from-literal=api_key="$1" \
-        --dry-run=client -o yaml | kubectl apply -f - >/dev/null ||
-        fail "could not write the $SECRET_NAME secret"
-}
-
 deploy_worker() {
     say "Worker deployment"
 
@@ -410,45 +404,19 @@ current_pod() {
     kc get pod -l app="$DEPLOYMENT" -o jsonpath='{.items[0].metadata.name}'
 }
 
-# The key the worker is holding right now, read back out of the cluster. Needed
-# so `rotate` can prove the old key is dead rather than assume it.
-current_secret_key() {
-    kc get secret "$SECRET_NAME" -o jsonpath='{.data.api_key}' 2>/dev/null |
-        base64 -d 2>/dev/null
-}
-
-# Blocks until a key is definitively rejected by Temporal Cloud.
+# Retried, because a single describe can fail for two unrelated reasons and
+# neither deserves a wrong answer.
 #
-# Revoking a lease deletes the key, but the auth layer keeps honouring it for a
-# few seconds — the parent demo documents the same lag in the other direction.
-# That lag is why `rotate` cannot treat "the worker polled after revocation" as
-# proof on its own: for a moment, polling with the deleted key still works.
+# It is no longer the credential. This role sets verify_propagation=true, so
+# plugin 0.3.0 confirmed the namespace grant on ten frontend connections before
+# Vault returned the key — a refusal here should now be rare rather than
+# expected. What remains is that the probe samples the frontends it can reach,
+# and that the worker may simply not have polled yet. Retrying covers both
+# without claiming which one it was.
 #
-# Several consecutive failures are required because a single probe is unreliable
-# in either direction.
-wait_for_key_dead() {
-    local key="$1" deadline=$((SECONDS + ${2:-120})) streak=0
-    while ((SECONDS < deadline)); do
-        if temporal workflow list --address "$TEMPORAL_ADDRESS" \
-            --namespace "$TEMPORAL_NAMESPACE" --api-key "$key" \
-            --limit 1 >/dev/null 2>&1; then
-            streak=0
-        else
-            streak=$((streak + 1))
-            ((streak >= 3)) && return 0
-        fi
-        printf '.'
-        sleep 3
-    done
-    return 1
-}
-
-# One-shot poller queries are unreliable for a reason that has nothing to do
-# with the worker: a freshly minted key is refused for the first few seconds
-# while its namespace grant propagates. `up` and `rotate` never notice because
-# wait_for_poller retries. `status` queried once, hid the error, and printed
-# "(none)" — telling the operator the worker was dead when it was polling
-# normally, which is the most misleading thing it could have said.
+# `status` previously queried once, hid the error, and printed "(none)" —
+# telling the operator the worker was dead when it was polling normally, which
+# is the most misleading thing it could have said.
 #
 # Prints the describe output and returns 0, or prints the last error and
 # returns 1. The caller decides how to present each case; they are not the same
@@ -482,8 +450,7 @@ describe_task_queue() {
 #     behind it has gone. Without matching the identity against the pod that is
 #     running now, a long-deleted pod satisfies the check.
 #   - A poller that last polled before the reference time proves nothing about
-#     the credential in use since. `rotate` passes the moment it revoked the old
-#     key, which is what makes a fresh poll evidence that the new key works.
+#     the credential supplied by the current VSO reconciliation.
 #
 # Usage: wait_for_poller <pod> <since-epoch> [timeout-seconds]
 wait_for_poller() {
@@ -520,14 +487,7 @@ wait_for_poller() {
 cmd_up() {
     # Validated before any work happens: a typo should cost nothing, not a
     # minikube start and an image build.
-    local vso_mode=0
-    if [[ -n "${1:-}" ]]; then
-        if [[ "$1" == "--vso" ]]; then
-            vso_mode=1
-        else
-            fail "unknown argument: $1 (did you mean --vso?)"
-        fi
-    fi
+    [[ -z "${1:-}" ]] || fail "unknown argument: $1"
 
     preflight
     resolve_endpoint
@@ -535,65 +495,38 @@ cmd_up() {
     minikube_up
     build_image
 
-    # Which role the confirmation probe draws its key from. It cannot be assumed
-    # to be the push-mode role: a clean checkout driven only with --vso never
-    # creates that one.
-    local probe_role="$WORKER_ROLE"
+    vault_role
 
-    if ((vso_mode)); then
-        probe_role="$WORKER_ROLE_VSO"
-        vault_role_vso
+    # rbac.yaml comes first because Vault's Kubernetes auth configuration reads
+    # the token reviewer's token from the Secret this manifest creates.
+    kc apply -f "$DEMO_DIR/k8s/vso/rbac.yaml" >/dev/null ||
+        fail "could not apply k8s/vso/rbac.yaml"
+    vault_k8s_auth
+    vso_install
 
-        # rbac.yaml before Vault is configured, because the token reviewer's
-        # token is read out of a Secret this creates.
-        kc apply -f "$DEMO_DIR/k8s/vso/rbac.yaml" >/dev/null ||
-            fail "could not apply k8s/vso/rbac.yaml"
-        vault_k8s_auth
-        vso_install
-
-        # The two modes cannot both own the Secret. VSO's destination.create
-        # makes it the owner, so any hand-written Secret is removed first —
-        # otherwise VSO and `kubectl apply` quietly contend over it and the
-        # worker's credential depends on which one wrote last.
-        say "Handing the Secret over to VSO"
-        if kc get secret "$SECRET_NAME" >/dev/null 2>&1 &&
-            ! kc get vaultdynamicsecret "$SECRET_NAME" >/dev/null 2>&1; then
-            kc delete secret "$SECRET_NAME" >/dev/null
-            info "removed the hand-written Secret"
-        else
-            info "nothing to hand over"
-        fi
-        # Push mode's bookkeeping does not apply here: VSO owns the lease now,
-        # and a stale file would let `rotate` revoke a lease it does not manage.
-        rm -f "$DEMO_DIR/.worker-lease"
-
-        apply_vso_manifests
+    # Migrate checkouts that previously ran the script-managed Secret mode.
+    # VSO's destination is the only writer now, so a Secret without the matching
+    # VaultDynamicSecret is legacy state and must be removed before handover.
+    say "VSO credential ownership"
+    if kc get secret "$SECRET_NAME" >/dev/null 2>&1 &&
+        ! kc get vaultdynamicsecret "$SECRET_NAME" >/dev/null 2>&1; then
+        kc delete secret "$SECRET_NAME" >/dev/null
+        info "removed the legacy script-managed Secret"
     else
-        vault_role
-
-        # Leaving the VaultDynamicSecret in place would have VSO overwrite the
-        # key this mode is about to write by hand.
-        if kc get vaultdynamicsecret "$SECRET_NAME" >/dev/null 2>&1; then
-            say "Taking the Secret back from VSO"
-            kc delete vaultdynamicsecret "$SECRET_NAME" --wait >/dev/null
-            kc delete secret "$SECRET_NAME" --ignore-not-found >/dev/null
-            info "VSO no longer owns $SECRET_NAME"
-        fi
-
-        say "Credential"
-        read -r WORKER_LEASE WORKER_KEY <<<"$(mint_key "$WORKER_ROLE")"
-        write_secret "$WORKER_KEY"
-        info "minted a key and wrote it to secret/$SECRET_NAME"
-        info "lease: $WORKER_LEASE"
-        # Recorded so `rotate` can revoke precisely this lease later, proving the
-        # worker moved off this key rather than merely still having a valid one.
-        printf '%s\n' "$WORKER_LEASE" >"$DEMO_DIR/.worker-lease"
+        info "Secret is ready for VSO ownership"
     fi
+    rm -f "$DEMO_DIR/.worker-lease"
+
+    apply_vso_manifests
 
     deploy_worker
 
     say "Confirming the worker authenticated"
-    mint_temp_key "$probe_role"
+    # Said here rather than left to `set -e`: without a key there is nothing to
+    # query Temporal Cloud with, and the poller wait below would spend 150s
+    # failing and then blame the worker for a Vault problem.
+    mint_temp_key "$WORKER_ROLE" ||
+        fail "could not mint a key to confirm with — check 'vault read $MOUNT/config'"
     STARTER_KEY="$TEMP_KEY"
     local pod since
     pod="$(current_pod)"
@@ -611,19 +544,9 @@ cmd_up() {
     say "Ready"
     info "./run.sh transfer   start a money transfer"
     info "./run.sh status     what exists right now"
-    if ((vso_mode)); then
-        info "./run.sh watch      watch VSO replace the credential, live"
-        # The opposite caveat from push mode: here the credential keeps being
-        # replaced on its own, so there is nothing to run and nothing to expire.
-        printf '\n\033[90m    VSO replaces this key about every %s. Nothing to run:\n' "$VSO_TTL"
-        printf '    the rotation is the demo.\033[0m\n'
-    else
-        info "./run.sh rotate     replace the key without restarting the pod"
-        # Nothing renews this lease, so the worker stops working when it expires.
-        # Better said here than discovered mid-meeting.
-        printf '\n\033[90m    The lease expires in %s. Nothing renews it, so the worker stops\n' "$WORKER_TTL"
-        printf '    working then — run "./run.sh rotate" to hand it a fresh key.\033[0m\n'
-    fi
+    info "./run.sh watch      watch VSO replace the credential, live"
+    printf '\n\033[90m    VSO replaces this key about every 60-70s, comfortably inside its %s\n' "$WORKER_TTL"
+    printf '    lease. Nothing to trigger: the lease drives the rotation automatically.\033[0m\n'
 }
 
 cmd_transfer() {
@@ -633,11 +556,13 @@ cmd_transfer() {
     say "Starting a transfer"
     # A short-lived credential for a short-lived process. This one is thrown
     # away when the transfer finishes; it is not the worker's key.
-    local key role
-    role="$(available_role)"
-    mint_temp_key "$role"
+    vault read "$MOUNT/service-accounts/$WORKER_ROLE" >/dev/null 2>&1 ||
+        fail "no VSO worker role exists — run './run.sh up' first"
+    local key
+    mint_temp_key "$WORKER_ROLE" ||
+        fail "could not mint a starter credential — check 'vault read $MOUNT/config'"
     key="$TEMP_KEY"
-    info "minted a starter credential from $MOUNT/creds/$role"
+    info "minted a starter credential from $MOUNT/creds/$WORKER_ROLE"
     (
         cd "$DEMO_DIR/app" &&
             TEMPORAL_ADDRESS="$TEMPORAL_ADDRESS" \
@@ -645,98 +570,6 @@ cmd_transfer() {
                 TEMPORAL_API_KEY="$key" \
                 go run ./start
     ) || fail "the transfer did not complete"
-}
-
-# The demo's strongest moment. Everything here is arranged so the conclusion
-# cannot be explained any other way than "the worker is using the new key".
-cmd_rotate() {
-    preflight
-    resolve_endpoint
-    require_vault_running
-
-    say "Before"
-    local pod_before restarts_before
-    pod_before="$(kc get pod -l app="$DEPLOYMENT" -o jsonpath='{.items[0].metadata.name}')"
-    restarts_before="$(kc get pod "$pod_before" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
-    info "pod $pod_before, restarts: $restarts_before"
-
-    local old_lease=""
-    [[ -f "$DEMO_DIR/.worker-lease" ]] && old_lease="$(cat "$DEMO_DIR/.worker-lease")"
-    [[ -n "$old_lease" ]] ||
-        fail "no recorded lease to rotate away from — run './run.sh up' first"
-
-    # Captured before it is overwritten: proving this exact key stops working is
-    # what rules out "the worker just kept using the old one".
-    local old_key
-    old_key="$(current_secret_key)"
-    [[ -n "$old_key" ]] || fail "could not read the current key from secret/$SECRET_NAME"
-
-    say "Issuing a replacement key"
-    local new_lease new_key
-    read -r new_lease new_key <<<"$(mint_key "$WORKER_ROLE")"
-    write_secret "$new_key"
-    printf '%s\n' "$new_lease" >"$DEMO_DIR/.worker-lease"
-    info "new lease: $new_lease"
-
-    # Revoking the old lease deletes that key in Temporal Cloud. From here on,
-    # a worker still holding it cannot authenticate at all — so continued
-    # polling is only possible on the new key.
-    say "Deleting the key the worker started with"
-    vault lease revoke "$old_lease" >/dev/null 2>&1 ||
-        info "(that lease had already expired)"
-    info "revoked $old_lease — the old key no longer exists in Temporal Cloud"
-
-    # Not enough on its own. Deletion reaches the auth layer a few seconds after
-    # Vault returns, so polling with the old key still succeeds for a moment.
-    # Wait until it is genuinely refused before starting to collect evidence.
-    say "Confirming the old key is actually dead"
-    if wait_for_key_dead "$old_key" 120; then
-        printf '\n'
-        info "the old key is now rejected by Temporal Cloud"
-    else
-        printf '\n'
-        fail "the old key still authenticates — cannot prove anything yet"
-    fi
-
-    # Everything after this instant is the evidence, and the instant is here
-    # rather than at revocation time on purpose: a poll recorded in between could
-    # have used the old key while it was still being honoured.
-    local since
-    since="$(date -u +%s)"
-
-    # kubelet refreshes a mounted Secret on its sync interval, not instantly, so
-    # this legitimately takes up to about a minute. The worker's requests fail
-    # with Unauthenticated until the file changes, and the SDK's retry carries it
-    # across the gap. Say so out loud rather than letting it look like a hang.
-    say "Waiting for kubelet to refresh the mounted Secret"
-    info "up to ~60s: this is the kubelet sync interval, not Vault or Temporal"
-    mint_temp_key "$WORKER_ROLE"
-    STARTER_KEY="$TEMP_KEY"
-    if wait_for_poller "$pod_before" "$since" 240; then
-        printf '\n'
-        info "$pod_before polled successfully after its old key was deleted"
-    else
-        printf '\n'
-        fail "the worker did not come back — './run.sh logs' will say why"
-    fi
-
-    say "After"
-    local pod_after restarts_after
-    pod_after="$(kc get pod -l app="$DEPLOYMENT" -o jsonpath='{.items[0].metadata.name}')"
-    restarts_after="$(kc get pod "$pod_after" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
-    info "pod $pod_after, restarts: $restarts_after"
-
-    if [[ "$pod_before" == "$pod_after" && "$restarts_before" == "$restarts_after" ]]; then
-        printf '\n\033[1;32m    Same pod, same restart count, and the key it booted with is deleted.\n'
-        printf '    The credential rotated underneath a process that never stopped.\033[0m\n'
-    else
-        # Reported rather than hidden: a restart means the SDK did not ride out
-        # the gap, and the claim above would be false.
-        printf '\n\033[1;31m    The pod restarted (%s/%s -> %s/%s).\n' \
-            "$pod_before" "$restarts_before" "$pod_after" "$restarts_after"
-        printf '    Rotation worked, but not without a restart — say so.\033[0m\n'
-        return 1
-    fi
 }
 
 cmd_status() {
@@ -760,12 +593,9 @@ cmd_status() {
         kc get deployment,pod,secret 2>/dev/null | sed 's/^/    /' ||
             info "nothing in $K8S_NAMESPACE"
 
-        # Which of the two credential paths is live. Worth stating outright: the
-        # Secret looks identical either way, so there is otherwise no way to tell
-        # from the output above who is filling it.
         if kc get vaultdynamicsecret "$SECRET_NAME" >/dev/null 2>&1; then
             info ""
-            info "credential owner: VSO (pull)"
+            info "credential owner: Vault Secrets Operator"
             # Conditions, not a `valid` field — VSO 1.5.1 reports health this way.
             #
             # LeaseRenewal=False is expected here and not a fault. This role's
@@ -777,7 +607,7 @@ cmd_status() {
                 sed 's/^/    /' || true
         else
             info ""
-            info "credential owner: run.sh (push)"
+            info "credential owner: not configured (VaultDynamicSecret missing)"
         fi
     else
         info "minikube is not running"
@@ -785,12 +615,12 @@ cmd_status() {
 
     say "Temporal Cloud"
     info "namespace $TEMPORAL_NAMESPACE at $TEMPORAL_ADDRESS"
-    local key role
-    role="$(available_role 2>/dev/null)" || {
-        info "(no Vault role exists yet, so there is nothing to query with)"
+    local key
+    vault read "$MOUNT/service-accounts/$WORKER_ROLE" >/dev/null 2>&1 || {
+        info "(the VSO worker role does not exist yet, so there is nothing to query with)"
         return 0
     }
-    mint_temp_key "$role" 2>/dev/null || {
+    mint_temp_key "$WORKER_ROLE" 2>/dev/null || {
         info "(could not mint a key to query with)"
         return 0
     }
@@ -811,51 +641,51 @@ cmd_logs() {
         fail "no worker pod found"
 }
 
-# The VSO demo, such as it is: nothing to run, just something to watch.
+# The VSO lifecycle is automatic: there is nothing to trigger, only something
+# to watch.
 #
 # Deliberately reads only the Kubernetes API. cmd_status mints a probe key on
 # every call, and a loop built on that would mint one every few seconds and
 # exhaust Temporal Cloud's 20-non-expired-keys-per-service-account cap within a
 # minute — turning the observation tool into the thing that breaks the demo.
 #
-# Prints a fingerprint of the key, never the key.
+# Watches the Secret's Kubernetes resourceVersion. It proves the destination
+# object changed without reading, decoding, or printing the API key itself.
 cmd_watch() {
     say "Watching $SECRET_NAME"
-    info "the key changes about every $VSO_TTL; the restart count should not"
+    info "VSO updates the Secret about every 60-70s; the restart count should not"
     printf '\n'
 
     local last=""
     while true; do
-        local key fp pod restarts marker
+        local revision pod restarts marker
         # `|| true` on every lookup below, and it is not decoration. The script
         # runs under `set -e -o pipefail`, so a missing Secret or a missing pod
         # would fail the assignment and kill the loop — turning "nothing to watch
         # yet" into a silent exit 1. Watching is exactly what someone does while
         # waiting for those things to appear.
-        key="$(kc get secret "$SECRET_NAME" \
-            -o jsonpath='{.data.api_key}' 2>/dev/null | base64 -d 2>/dev/null)" || true
-        if [[ -z "$key" ]]; then
+        revision="$(kc get secret "$SECRET_NAME" \
+            -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null)" || true
+        if [[ -z "$revision" ]]; then
             printf '    %s   no %s yet\n' "$(date -u +%H:%M:%S)" "$SECRET_NAME"
             sleep 5
             continue
         fi
-        fp="$(printf '%s' "$key" | shasum -a 256 | cut -c1-12)"
 
         # The pod name is printed rather than assumed constant: during a rollout
-        # there are briefly two, and a changed name here means the credential was
-        # picked up by a new process, which would not prove what this demo
-        # claims.
+        # there are briefly two. A changed name here means the Secret update
+        # coincided with a rollout, which weakens the no-restart demonstration.
         pod="$(kc get pod -l app="$DEPLOYMENT" \
             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" || true
         restarts="$(kc get pod -l app="$DEPLOYMENT" \
             -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null)" || true
 
         marker=""
-        [[ -n "$last" && "$fp" != "$last" ]] && marker="   <- rotated"
-        last="$fp"
+        [[ -n "$last" && "$revision" != "$last" ]] && marker="   <- Secret updated"
+        last="$revision"
 
-        printf '    %s   key %s   pod %s   restarts %s%s\n' \
-            "$(date -u +%H:%M:%S)" "$fp" "${pod:-none}" "${restarts:-?}" "$marker"
+        printf '    %s   secret-rv %s   pod %s   restarts %s%s\n' \
+            "$(date -u +%H:%M:%S)" "$revision" "${pod:-none}" "${restarts:-?}" "$marker"
         sleep 10
     done
 }
@@ -923,22 +753,20 @@ cmd_down() {
 
     say "Revoking credentials and deleting the role"
     if vault status >/dev/null 2>&1; then
-        vault lease revoke -prefix "$MOUNT/creds/$WORKER_ROLE" >/dev/null 2>&1 &&
-            info "revoked outstanding leases"
-        vault delete "$MOUNT/service-accounts/$WORKER_ROLE" >/dev/null 2>&1 &&
-            info "deleted $WORKER_ROLE from Vault and Temporal Cloud"
-
         # Deleting the service account matters more here than revoking leases.
         # Temporal Cloud issues these keys with a ~24-hour expiry and Vault is
         # what cuts them short, so if this dev Vault ever restarts with leases
         # in flight, the keys it was tracking stay valid for a day against a cap
         # of 20 per service account. At a two-minute cadence that adds up fast.
         # Deleting the service account removes them all.
-        if vault read "$MOUNT/service-accounts/$WORKER_ROLE_VSO" >/dev/null 2>&1; then
-            vault lease revoke -prefix "$MOUNT/creds/$WORKER_ROLE_VSO" >/dev/null 2>&1 || true
-            vault delete "$MOUNT/service-accounts/$WORKER_ROLE_VSO" >/dev/null 2>&1 &&
-                info "deleted $WORKER_ROLE_VSO and its Temporal Cloud service account"
-        fi
+        local role
+        for role in "$WORKER_ROLE" "$LEGACY_WORKER_ROLE"; do
+            if vault read "$MOUNT/service-accounts/$role" >/dev/null 2>&1; then
+                vault lease revoke -prefix "$MOUNT/creds/$role" >/dev/null 2>&1 || true
+                vault delete "$MOUNT/service-accounts/$role" >/dev/null 2>&1 &&
+                    info "deleted $role and its Temporal Cloud service account"
+            fi
+        done
 
         if vault auth list -format=json 2>/dev/null |
             jq -e --arg p "$K8S_AUTH_PATH/" 'has($p)' >/dev/null; then
@@ -967,13 +795,12 @@ cmd_down() {
 case "${1:-}" in
 up) cmd_up "${2:-}" ;;
 transfer) cmd_transfer ;;
-rotate) cmd_rotate ;;
 status) cmd_status ;;
 logs) cmd_logs ;;
 watch) cmd_watch ;;
 down) cmd_down "${2:-}" ;;
 *)
-    printf 'usage: %s {up|transfer|rotate|status|logs|down [--all]}\n' "${0##*/}"
+    printf 'usage: %s {up|transfer|status|logs|watch|down [--all]}\n' "${0##*/}"
     exit 1
     ;;
 esac
