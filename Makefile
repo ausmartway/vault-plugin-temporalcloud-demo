@@ -50,6 +50,10 @@ demo: up ## Run the interactive demo (type-along, advances on ENTER)
 auto: up ## Run the demo unattended, no keypresses (AUTO_PLAY_MODE)
 	@AUTO_PLAY_MODE=1 ./demo.sh
 
+.PHONY: performance-test
+performance-test: up ## Measure API-key issuance and immediate validity for 12 hours
+	@./scripts/performance-test.sh
+
 .PHONY: reset
 reset: ## Revoke leases, delete Temporal Cloud service accounts, tear Vault down
 	@./reset.sh

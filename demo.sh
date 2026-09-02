@@ -71,48 +71,16 @@ fi
 # Read-only helper so the narration commands look like the real thing on screen.
 tc() { tcld --api-key "$TEMPORAL_API_KEY" "$@"; }
 
-# These two waiters exist for one specific reason, and it is NOT that the plugin
-# fails to confirm its work. It does: every mutating Cloud Ops call reads the
-# resource back and blocks until it reached the requested state
-# (client/confirm.go), with deletion confirmed by RESOURCE_STATE_DELETED rather
-# than by waiting for a NotFound. Against the Cloud Ops API, no waiting is
-# needed anywhere in this demo — that is why nothing else here polls.
-#
-# But this demo does not verify through the Cloud Ops API. It verifies by
-# *authenticating with the key* (`tcld --api-key "$API_KEY" ...`), and that is a
-# different plane with its own lag. Measured on back-to-back runs of this exact
-# script: one run had both transitions instant, the next had a freshly minted key
-# rejected with Unauthenticated AND a revoked key still listing namespaces — even
-# though `apikey list` confirmed zero keys remained. Resource-plane consistency
-# does not imply auth-plane consistency.
-#
-# So: no polling around anything the engine guarantees, polling only around the
-# two calls that authenticate. Several consecutive identical results are required
-# because a single probe is unreliable in either direction.
-CONFIRM_VALID=2
+# Plugin 0.3.0 verifies a newly minted key with ten independent connections
+# to each namespace frontend over at least 450ms before returning it. The probe
+# policy is configured once per mount; the namespace-granted role below opts in.
+# Revocation still crosses from the Cloud Ops resource plane to the auth plane,
+# so keep one waiter for the deliberately reused key. Several consecutive
+# failures are required because a single auth probe can be unreliable.
 CONFIRM_REVOKED=3
 
-# Both waiters print a dot per probe. Without it the screen sits blank, which
-# reads as a hang at the two most dramatic moments of the demo.
-wait_for_key_valid() {
-    local streak=0
-    for _ in {1..20}; do
-        if tcld --api-key "$1" namespace list >/dev/null 2>&1; then
-            streak=$((streak + 1))
-            [[ $streak -ge $CONFIRM_VALID ]] && {
-                printf '\nkey is live\n'
-                return 0
-            }
-        else
-            streak=0
-        fi
-        printf '.'
-        sleep 3
-    done
-    printf '\nkey never became valid — check the Temporal Cloud UI\n' >&2
-    return 1
-}
-
+# Print a dot per probe. Without it the screen sits blank, which reads as a hang
+# at the most dramatic moment of the demo.
 wait_for_key_revoked() {
     local streak=0
     for _ in {1..20}; do
@@ -224,8 +192,12 @@ say "2. Give Vault one bootstrap credential — the last static key"
 # unquoted, so backslash-continuations get mangled before Vault ever sees them.
 pe "vault write $MOUNT/config api_key=\"\$TEMPORAL_API_KEY\" admin_service_account_id=\"\$TEMPORAL_ADMIN_SA_ID\""
 
-say "Read it back — the key never comes out again, but note api_key_id: Vault derived that from the key itself."
+say "Plugin 0.3.0 configures propagation sampling once for the whole mount."
+pe "vault write $MOUNT/config/probe interval=50ms consecutive_successes=10"
+
+say "Read them back — the bootstrap key never comes out again, but note api_key_id: Vault derived that from the key itself."
 pe "vault read $MOUNT/config"
+pe "vault read $MOUNT/config/probe"
 
 ########################################################################
 say "3. Define three roles: broad, least-privilege, and metrics-only"
@@ -242,7 +214,7 @@ say "Role B — that same account-level read, plus write on exactly one namespac
 # The `read` floor is this plugin's rule (account_role is required on every
 # write), not Temporal Cloud's: the Cloud API accepts a service account with no
 # account-level role at all.
-pe "vault write $MOUNT/service-accounts/$SA_SCOPED account_role=read namespace_access=\"\$TEMPORAL_NAMESPACE=write\" ttl=5m max_ttl=1h description='Account read, plus write on one namespace'"
+pe "vault write $MOUNT/service-accounts/$SA_SCOPED account_role=read namespace_access=\"\$TEMPORAL_NAMESPACE=write\" verify_propagation=true ttl=5m max_ttl=1h description='Account read, plus write on one namespace'"
 
 pe "vault read $MOUNT/service-accounts/$SA_SCOPED"
 
@@ -289,12 +261,11 @@ fi
 say "Capture one and actually use it."
 pe "API_KEY=\$(vault read -field=api_key $MOUNT/creds/$SA_SCOPED)"
 
-say "The key exists the moment Vault returns it. Its auth layer takes a few seconds to catch up:"
-pe_ok "wait_for_key_valid \"\$API_KEY\""
-# Be careful what this claims. It proves the key authenticates — nothing more.
-# `namespace list` succeeds on the account-level `read`, not on the namespace
-# grant, so it is not evidence of scoping. Demonstrating the scoping would take
-# a second namespace this key was deliberately not given.
+say "Plugin 0.3.0 verified the key on ten independent frontend connections before Vault returned it:"
+# Be careful what this claims. The command proves the key authenticates;
+# verify_propagation is what tested the namespace grant before the creds read
+# returned. Demonstrating exclusion would take a second namespace this key was
+# deliberately not given.
 pe_ok "tcld --api-key \"\$API_KEY\" namespace list"
 
 say "A credential Vault minted seconds ago, authenticating against Temporal Cloud."
@@ -351,6 +322,17 @@ pe_ok "tc apikey list | jq '[.apiKeys[] | select(.spec.displayName | startswith(
 ########################################################################
 say "That's the model"
 ########################################################################
+# Held back from the printed summary — talk track, not slide. Paste the block
+# back inside the heredoc below to show it on screen again. It cannot be
+# commented out in place: heredoc content is literal, so a leading '#' would
+# print rather than comment.
+#
+# Worth mentioning if it comes up:
+#   - Temporal Cloud caps a service account at 20 non-expired keys, so that is
+#     the ceiling on concurrent leases per role.
+#   - The bootstrap key has its own TTL (root_key_ttl, 90d default).
+#     `vault write -f temporalcloud/config/rotate-root` replaces it, and Vault
+#     then holds a root credential no human has ever seen.
 cat <<'EOF'
 
   - No human ever saw a key an application uses. Exactly one long-lived key
@@ -358,13 +340,6 @@ cat <<'EOF'
   - Access is scoped per role, not per person.
   - Revocation is one command, and it is real: the credential is deleted in
     Temporal Cloud, not just forgotten by Vault.
-
-Worth mentioning if it comes up:
-  - Temporal Cloud caps a service account at 20 non-expired keys, so that is
-    the ceiling on concurrent leases per role.
-  - The bootstrap key has its own TTL (root_key_ttl, 90d default).
-    `vault write -f temporalcloud/config/rotate-root` replaces it, and Vault
-    then holds a root credential no human has ever seen.
 
 To delete the service accounts and tear Vault down, run `make reset`.
 

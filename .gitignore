@@ -5,6 +5,10 @@
 plugins/
 .plugin-cache/
 
+# Long-running performance-test output and single-run lock.
+performance-results/
+.performance-test.lock/
+
 # Local design notes — working material, not part of what a customer reads.
 docs/superpowers/
 

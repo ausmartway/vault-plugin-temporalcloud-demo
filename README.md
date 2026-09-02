@@ -49,16 +49,20 @@ forget the credential on revoke — it calls Temporal Cloud and deletes it.
 1. **Register and mount the plugin.** Registration is by the binary's SHA256 —
    Vault refuses to load a plugin whose hash doesn't match. This is the
    supply-chain check, and it's why the release ships `_SHA256SUMS`.
-2. **Configure one bootstrap credential.** The last static key that will ever
-   exist. Reading `config` back shows the key never comes out again.
+2. **Configure the mount.** Supply the last static bootstrap key and set the
+   mount-wide propagation probe to ten successes at 50 ms intervals. Reading
+   `config` back shows the key never comes out again.
 3. **Define three roles** — one with account-wide read, one scoped to a single
    namespace, one `metrics-read` for a scraper that should never see a
    workflow. Each creates a real service account in Temporal Cloud. These are
    templates; no API key exists yet.
-4. **Read a credential.** Vault mints a key, returns it under a lease, and the
-   demo uses that key against Temporal Cloud to prove it works. The same read
-   runs three times — three distinct keys under three independent leases,
-   because nothing is cached or shared between consumers.
+4. **Read a credential.** Vault mints a key and returns it under a lease. For
+   the namespace-granted role, plugin 0.3.0 verifies propagation with ten
+   independent namespace-frontend connections over at least 450 milliseconds
+   before returning; the demo then uses the key against
+   Temporal Cloud. The same read runs three times — three distinct keys under
+   three independent leases, because nothing is cached or shared between
+   consumers.
 5. **Show the lease.** Renewal extends it without ever calling Temporal Cloud.
 6. **Revoke.** The same key is rejected seconds later — because it no longer
    exists.
@@ -107,10 +111,43 @@ make demo
 |---|---|
 | `make demo` | Start Vault if needed, run the interactive walkthrough |
 | `make auto` | Same walkthrough, no keypresses — smoke test or screen recording |
+| `make performance-test` | Sample API-key issuance and immediate validity for 12 hours |
 | `make status` | What exists right now, in Vault *and* in Temporal Cloud |
 | `make reset` | Revoke leases, delete the demo service accounts, tear Vault down |
 | `make up` / `make down` | Start / stop Vault only |
 | `make plugin` | Checksum-verify the plugin binary, downloading it only if it isn't already there |
+
+### 12-hour propagation performance test
+
+```bash
+make performance-test
+```
+
+The test takes one sample per minute for 12 hours. Each sample measures the
+wall-clock time for `vault read` to return a newly issued key, then immediately
+uses that key for `DescribeNamespace` against the namespace frontend—the same
+RPC plugin 0.3.0 uses for propagation verification. There are no validation
+retries: `valid=true` means the first independent call after Vault returned
+succeeded. If that call returns `valid=false`, the test immediately increases
+the mount's `consecutive_successes` setting by one for subsequent credentials,
+up to the plugin maximum of 20. Each result records the setting it used and any
+adjustment it triggered.
+
+Every lease is revoked after validation to stay below Temporal Cloud's 20-key
+limit. Results are streamed as JSON Lines to `performance-results/`, without
+API-key tokens, and a JSON summary is written when the run exits. Interrupting
+the script also revokes outstanding leases and removes its dedicated service
+account.
+
+Defaults can be overridden for a shorter smoke test or a different sampling
+interval:
+
+```bash
+DURATION_SECONDS=300 INTERVAL_SECONDS=10 make performance-test
+```
+
+Keep the machine awake and the terminal open for the full run, or launch it
+under your preferred process supervisor.
 
 ---
 
