@@ -24,11 +24,14 @@ set +a
 : "${TEMPORAL_API_KEY:?set TEMPORAL_API_KEY in .env}"
 : "${TEMPORAL_ADMIN_SA_ID:?set TEMPORAL_ADMIN_SA_ID in .env}"
 : "${TEMPORAL_NAMESPACE:?set TEMPORAL_NAMESPACE in .env}"
+# Deliberately no default: a fallback version here would be a second pin, and
+# .env wins over it. Bumping the plugin in one place would then silently keep
+# serving the old one. .env is the only pin.
+: "${PLUGIN_VERSION:?set PLUGIN_VERSION in .env — it is the only plugin pin}"
 
 export VAULT_PORT="${VAULT_PORT:-8200}"
 export VAULT_TOKEN="${VAULT_TOKEN:-root}"
 export MOUNT="${MOUNT:-temporalcloud}"
-export PLUGIN_VERSION="${PLUGIN_VERSION:-0.1.1}"
 export PLUGIN_NAME="vault-plugin-secrets-temporalcloud"
 export PLUGIN_DIR="$REPO_ROOT/plugins"
 
