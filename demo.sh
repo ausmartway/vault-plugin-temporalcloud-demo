@@ -11,7 +11,7 @@
 # shellcheck source=scripts/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/scripts/common.sh"
 
-require_cmd tcld
+require_cmd temporal
 require_cmd jq
 require_vault_running
 
@@ -27,8 +27,13 @@ require_vault_running
 # before the first slide instead.
 preflight_clean() {
     local existing
-    existing="$(tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account list --page-size 100 2>/dev/null |
-        jq -r '.serviceAccount[]? | select(.spec.name | startswith("demo-app-")) | .spec.name' || true)"
+    # `-o json` capitalises the envelope and snake_cases the fields, which is
+    # not what the same CLI does elsewhere: `service-account get -o json`
+    # returns camelCase. Each subcommand's shape has to be checked rather than
+    # assumed.
+    existing="$(temporal cloud service-account list --api-key "$TEMPORAL_CLOUD_API_KEY" \
+        --page-size 100 -o json 2>/dev/null |
+        jq -r '.ServiceAccounts[]? | select(.spec.name | startswith("demo-app-")) | .spec.name' || true)"
     [[ -z "$existing" ]] && return 0
     echo "ERROR: these demo service accounts already exist in Temporal Cloud:" >&2
     echo "$existing" | sed 's/^/  - /' >&2
@@ -68,9 +73,6 @@ if [[ "${AUTO_PLAY_MODE:-0}" == "1" ]]; then
     stty() { :; }
 fi
 
-# Read-only helper so the narration commands look like the real thing on screen.
-tc() { tcld --api-key "$TEMPORAL_CLOUD_API_KEY" "$@"; }
-
 # Plugin 0.3.1 verifies a newly minted key with ten independent connections
 # to each namespace frontend over at least 450ms before returning it. The probe
 # policy is configured once per mount and every role verifies by default.
@@ -84,7 +86,7 @@ CONFIRM_REVOKED=3
 wait_for_key_revoked() {
     local streak=0
     for _ in {1..20}; do
-        if tcld --api-key "$1" namespace list >/dev/null 2>&1; then
+        if temporal cloud namespace list --api-key "$1" >/dev/null 2>&1; then
             streak=0
         else
             streak=$((streak + 1))
@@ -100,9 +102,13 @@ wait_for_key_revoked() {
     return 1
 }
 
-# demo-magic's `pe` evals in this shell, so the vault() and tc() functions,
-# every .env value, and the SA_BROAD/SA_SCOPED role names common.sh derives are
-# all in scope for the commands typed below.
+# demo-magic's `pe` evals in this shell, so the vault() function, every .env
+# value, and the SA_BROAD/SA_SCOPED role names common.sh derives are all in
+# scope for the commands typed below.
+#
+# temporal is spelled out in full at every call site rather than wrapped in a short
+# helper. The commands on screen are meant to be ones an audience can copy into
+# their own shell, and a local alias is neither copyable nor searchable.
 
 say() { printf '\n\033[1;33m%s\033[0m\n' "$1"; }
 
@@ -196,7 +202,12 @@ say "2. Give Vault one bootstrap credential — the last static key"
 # unquoted, so backslash-continuations get mangled before Vault ever sees them.
 pe "vault write $MOUNT/config api_key=\"\$TEMPORAL_CLOUD_API_KEY\""
 
-say "Plugin 0.3.1 configures propagation sampling once for the whole mount."
+# These are 0.3.1's own defaults (client/probe.go: 50ms, ten successes), so this
+# write changes nothing. It is here to put the knob on screen: the sampling
+# policy is set once per mount rather than per role, and an account that
+# propagates slowly is tuned here and nowhere else. Say so rather than letting
+# the narration imply the demo had to configure it.
+say "Propagation sampling is one policy for the whole mount, not a per-role setting. These are 0.3.1's defaults — writing them changes nothing, but this is the knob to turn if an account propagates slowly."
 pe "vault write $MOUNT/config/probe interval=50ms consecutive_successes=10"
 
 say "Read them back — the bootstrap key never comes out again, but note api_key_id and admin_service_account_id: Vault derived both from the key itself."
@@ -233,10 +244,19 @@ say "Role C — a different account role entirely: metrics, and nothing else."
 pe "vault write $MOUNT/service-accounts/$SA_METRICS account_role=metrics-read ttl=5m max_ttl=1h description='Metrics scraper: no namespace access at all'"
 
 say "All three service accounts now exist in Temporal Cloud:"
-# --page-size matters: tcld pages at 10 by default, so on a busy account the
-# three just created can fall off the first page entirely. Filtering to
-# demo-app- also keeps unrelated service accounts off the projector.
-pe "tc service-account list --page-size 100 | jq -r '.serviceAccount[] | select(.spec.name | startswith(\"demo-app-\")) | \"\\(.spec.name)\\t\\(.spec.access.accountAccess.role)\"'"
+# The CLI's own table, filtered to this demo's accounts rather than reshaped by
+# jq. --page-size guards against the three just created falling off a first page
+# on a busy account; the grep keeps unrelated accounts off the projector.
+pe "temporal cloud service-account list --api-key \"\$TEMPORAL_CLOUD_API_KEY\" --page-size 100 | grep demo-app-"
+
+say "And one of them in full, as Temporal Cloud sees it — note the role and the single namespace grant:"
+# `get` rather than `list`, because the role is only legible here: `list -o json`
+# returns the account role as an integer enum (read is 5), while `get` renders it
+# as ROLE_READ. Worth knowing before building anything else on this CLI's JSON.
+#
+# The ID comes from Vault, which recorded it when it created the account — so
+# this is Vault's own record being looked up in Temporal Cloud, not a name match.
+pe "temporal cloud service-account get --service-account-id \$(vault read -field=service_account_id $MOUNT/service-accounts/$SA_SCOPED) --api-key \"\$TEMPORAL_CLOUD_API_KEY\""
 
 ########################################################################
 say "4. Ask Vault for a credential"
@@ -273,7 +293,7 @@ say "Plugin 0.3.1 verified the key on ten independent frontend connections befor
 # propagation verification is what tested the namespace grant before the creds
 # read returned. Demonstrating exclusion would take a second namespace this key
 # was deliberately not given.
-pe_ok "tcld --api-key \"\$API_KEY\" namespace list"
+pe_ok "temporal cloud namespace list --api-key \"\$API_KEY\""
 
 say "A credential Vault minted seconds ago, authenticating against Temporal Cloud."
 pause
@@ -299,7 +319,10 @@ fi
 say "Here are the keys Vault has minted, as Temporal Cloud sees them:"
 # Vault names every key it mints "vault-<role>-<random>", which is how you tell
 # Vault-issued credentials from hand-created ones in the Temporal Cloud UI.
-pe_ok "tc apikey list | jq -r '.apiKeys[] | select(.spec.displayName | startswith(\"vault-demo-app-\")) | \"\\(.spec.displayName)\\texpires \\(.spec.expiryTime)\"'"
+# jq rather than the plain table here because expiry is the whole point of this
+# step, and the table has no expiry column. `expiry_time` arrives as an epoch
+# object, so `.seconds | todate` is what makes it readable.
+pe_ok "temporal cloud apikey list --api-key \"\$TEMPORAL_CLOUD_API_KEY\" -o json | jq -r '.ApiKeys[] | select(.spec.display_name | startswith(\"vault-demo-app-\")) | \"\\(.spec.display_name)\\texpires \\(.spec.expiry_time.seconds | todate)\"'"
 
 # The expiry on screen says ~24h while the lease says 5m, and that contradiction
 # is the first thing a security-minded audience asks about. Answer it unprompted:
@@ -318,13 +341,43 @@ say "Vault has already deleted it in Temporal Cloud. Same key, seconds later:"
 # worth showing. A timeout must not swallow the punchline.
 pe_ok "wait_for_key_revoked \"\$API_KEY\""
 # Expected to fail. That failure is the whole demo.
-pe "tcld --api-key \"\$API_KEY\" namespace list || echo '>>> rejected — the key no longer exists in Temporal Cloud'"
+pe "temporal cloud namespace list --api-key \"\$API_KEY\" || echo '>>> rejected — the key no longer exists in Temporal Cloud'"
 
 say "Deleted, not just forgotten — the same list from a minute ago:"
 # The rejection above proves one key stopped working. This proves all of them
 # are gone from Temporal Cloud entirely, which is the stronger claim the closing
 # slide makes. Expect 0.
-pe_ok "tc apikey list | jq '[.apiKeys[] | select(.spec.displayName | startswith(\"vault-demo-app-\"))] | length'"
+pe_ok "temporal cloud apikey list --api-key \"\$TEMPORAL_CLOUD_API_KEY\" -o json | jq '[.ApiKeys[] | select(.spec.display_name | startswith(\"vault-demo-app-\"))] | length'"
+
+pause
+
+########################################################################
+say "7. Retire the last static key"
+########################################################################
+# Deliberately last, and it is one-way. rotate-root deletes the bootstrap key
+# in Temporal Cloud, which is the key .env holds — so every `temporal cloud` call in this
+# script stops working the moment it runs. Nothing below calls Temporal Cloud.
+#
+# That is also why the whole demo is safe to run against a throwaway admin key:
+# by the end there is nothing left worth keeping.
+say "Everything so far rested on one long-lived key — the one pasted into .env. Note the api_key_id Vault is holding now:"
+pe "vault read $MOUNT/config"
+
+say "rotate-root mints a replacement on the same service account, verifies it, stores it, and deletes the key it replaced."
+pe "vault write -f $MOUNT/config/rotate-root"
+
+say "Different api_key_id. Vault minted this one for itself, and no human has ever seen it:"
+pe "vault read $MOUNT/config"
+
+say "The key you pasted into .env is now gone from Temporal Cloud. This is expected to fail:"
+# The strongest proof available, and it costs nothing: the credential the
+# operator supplied is the one being rejected.
+pe "temporal cloud namespace list --api-key \"\$TEMPORAL_CLOUD_API_KEY\" || echo '>>> rejected — the bootstrap key no longer exists'"
+
+say "Vault carries on regardless, still minting against Temporal Cloud:"
+# Proof the mount is healthy on the new credential rather than merely quiet.
+# This mints one more key, which `make reset` cleans up with everything else.
+pe "vault read $MOUNT/creds/$SA_BROAD"
 
 ########################################################################
 say "That's the model"
@@ -337,13 +390,13 @@ say "That's the model"
 # Worth mentioning if it comes up:
 #   - Temporal Cloud caps a service account at 20 non-expired keys, so that is
 #     the ceiling on concurrent leases per role.
-#   - The bootstrap key has its own TTL (root_key_ttl, 90d default).
-#     `vault write -f temporalcloud/config/rotate-root` replaces it, and Vault
-#     then holds a root credential no human has ever seen.
+#   - The replacement root key carries root_key_ttl (90 days by default), so
+#     even Vault's own credential expires. Running rotate-root again before then
+#     is how you keep it fresh, and nothing outside Vault ever holds it.
 cat <<'EOF'
 
-  - No human ever saw a key an application uses. Exactly one long-lived key
-    exists — the bootstrap key in step 2 — and rotate-root retires even that.
+  - No human ever saw a key an application uses. One long-lived key existed —
+    the bootstrap key from step 2 — and step 7 deleted it.
   - Access is scoped per role, not per person.
   - Revocation is one command, and it is real: the credential is deleted in
     Temporal Cloud, not just forgotten by Vault.
@@ -351,3 +404,10 @@ cat <<'EOF'
 To delete the service accounts and tear Vault down, run `make reset`.
 
 EOF
+
+# Said after the summary, in red, because it is the one thing that will bite
+# the next person to run this. Step 7 deleted the key .env holds; a rerun needs
+# a new one, and `make reset`'s orphan sweep cannot reach Temporal Cloud until
+# it has one.
+printf '\033[1;31mTEMPORAL_CLOUD_API_KEY in .env no longer works — step 7 deleted it.\n'
+printf 'Put a fresh admin service-account key in .env before running this again.\033[0m\n\n'

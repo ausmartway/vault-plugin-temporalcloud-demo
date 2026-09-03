@@ -19,13 +19,19 @@ else
     echo "not running — 'make up' to start it"
 fi
 
-# --page-size: tcld pages service accounts at 10 by default, and a status check
-# that silently omits what you are looking for is worse than no status check.
-# `apikey list` has no such flag, so nothing to do there.
+# The CLI's own tables rather than jq over `-o json`, and that is not laziness:
+# `-o json` leaves every enum as an integer — an account role reads as 5, an
+# owner type as 2 — while the text table renders them as ROLE_READ and
+# SERVICE_ACCOUNT. For output a human is reading, the table is the accurate one.
+#
+# The trade is that the tables carry no role or expiry column. For either, ask
+# about one account directly:
+#   temporal cloud service-account get --service-account-id <id> --api-key ...
+#
+# --page-size guards against a status check silently omitting what you are
+# looking for, which is worse than no status check at all.
 hdr "Temporal Cloud service accounts"
-tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account list --page-size 100 |
-    jq -r '.serviceAccount[] | "\(.spec.name)\t\(.spec.access.accountAccess.role)\t\(.id)"'
+temporal cloud service-account list --api-key "$TEMPORAL_CLOUD_API_KEY" --page-size 100
 
 hdr "Temporal Cloud API keys"
-tcld --api-key "$TEMPORAL_CLOUD_API_KEY" apikey list |
-    jq -r '.apiKeys[] | "\(.spec.displayName)\towner=\(.owner.ownerType)\texpires=\(.spec.expiryTime)"'
+temporal cloud apikey list --api-key "$TEMPORAL_CLOUD_API_KEY"

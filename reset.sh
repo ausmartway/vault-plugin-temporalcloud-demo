@@ -53,25 +53,31 @@ rm -rf "$PLUGIN_DIR"
 # against an account it did not create, and `up` fails on a name this repo
 # created itself, so a sweep that covered only demo-app-* left the Kubernetes
 # demo permanently wedged after something as ordinary as a reboot.
-if command -v tcld >/dev/null 2>&1; then
+if command -v temporal >/dev/null 2>&1; then
     echo "==> Checking Temporal Cloud for orphaned demo service accounts"
     # Report a failed lookup instead of swallowing it. Under `set -euo pipefail`
-    # a failing tcld here used to abort the whole reset with stderr discarded —
+    # a failing lookup here used to abort the whole reset with stderr discarded —
     # so the operator saw neither "Clean." nor any reason why. A sweep that
     # cannot run is exactly when you need to be told.
-    # --page-size: tcld pages at 10 by default, which would hide orphans on an
-    # account that has more than ten service accounts.
-    if ! sa_list="$(tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account list --page-size 100 2>&1)"; then
-        echo "    could not reach Temporal Cloud — check for leftover demo-app-* and demo-k8s-worker* accounts by hand"
+    # --page-size guards against orphans hiding past the first page on an
+    # account with many service accounts.
+    if ! sa_list="$(temporal cloud service-account list --api-key "$TEMPORAL_CLOUD_API_KEY" \
+        --page-size 100 -o json 2>&1)"; then
+        echo "    could not reach Temporal Cloud — if the demo ran to step 7, it deleted"
+        echo "    the key in .env; supply a fresh one, or remove leftover demo-app-* and"
+        echo "    demo-k8s-worker* accounts by hand"
         sa_list='{}'
     fi
-    orphans="$(jq -r '.serviceAccount[]?
+    # ServiceAccounts, capitalised: `temporal cloud service-account list -o json`
+    # capitalises the envelope, unlike `... get -o json` which does not.
+    orphans="$(jq -r '.ServiceAccounts[]?
         | select(.spec.name | startswith("demo-app-") or startswith("demo-k8s-worker"))
         | "\(.id)\t\(.spec.name)"' <<<"$sa_list")"
     if [[ -n "$orphans" ]]; then
         echo "$orphans" | while IFS=$'\t' read -r id name; do
             echo "    deleting orphan: $name ($id)"
-            tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account delete --service-account-id "$id" >/dev/null 2>&1 ||
+            temporal cloud service-account delete --service-account-id "$id" \
+                --api-key "$TEMPORAL_CLOUD_API_KEY" >/dev/null 2>&1 ||
                 echo "    could not delete $name — remove it in the Temporal Cloud UI"
         done
     else

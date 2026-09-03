@@ -14,7 +14,7 @@ if [[ ! -f "$REPO_ROOT/.env" ]]; then
     exit 1
 fi
 
-# `set -a` exports everything the file defines, so child processes (vault, tcld,
+# `set -a` exports everything the file defines, so child processes (vault, temporal,
 # docker compose) inherit it without us re-exporting each name by hand.
 set -a
 # shellcheck disable=SC1091
@@ -45,7 +45,7 @@ export VAULT_ADDR="http://127.0.0.1:${VAULT_PORT}"
 # demo.sh created, and one definition is the only way that stays true.
 # The scoped role's name follows TEMPORAL_NAMESPACE so it can never advertise a
 # namespace .env no longer points at. Only the prefix is used: the account
-# suffix in "vault-test.rgumq" is noise in a service account name.
+# suffix in "my-namespace.a1b2c" is noise in a service account name.
 export SA_BROAD="demo-app-account-level-read"
 export SA_SCOPED="demo-app-${TEMPORAL_NAMESPACE%%.*}-namespace-write"
 export SA_METRICS="demo-app-metrics-read"

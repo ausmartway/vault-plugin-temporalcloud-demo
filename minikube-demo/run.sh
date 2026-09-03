@@ -66,7 +66,7 @@ kc() { kubectl --namespace "$K8S_NAMESPACE" "$@"; }
 # Preflight
 ########################################################################
 preflight() {
-    for cmd in minikube kubectl docker jq tcld temporal helm; do
+    for cmd in minikube kubectl docker jq temporal helm; do
         require_cmd "$cmd"
     done
     docker info >/dev/null 2>&1 || fail "the Docker daemon is not running"
@@ -79,18 +79,24 @@ preflight() {
 # looks like a credential problem and is not.
 resolve_endpoint() {
     local ns_json
-    ns_json="$(tcld --api-key "$TEMPORAL_CLOUD_API_KEY" namespace get \
-        --namespace "$TEMPORAL_NAMESPACE" 2>/dev/null)" ||
+    ns_json="$(temporal cloud namespace get --namespace "$TEMPORAL_NAMESPACE" \
+        --api-key "$TEMPORAL_CLOUD_API_KEY" -o json 2>/dev/null)" ||
         fail "could not read namespace $TEMPORAL_NAMESPACE from Temporal Cloud"
 
-    TEMPORAL_ADDRESS="$(jq -r '.uri.regionalGrpc // empty' <<<"$ns_json")"
+    # camelCase here, unlike `service-account list -o json` which is snake_case
+    # under a capitalised envelope. The shape is per-subcommand, so both spellings
+    # appear in this repo on purpose.
+    TEMPORAL_ADDRESS="$(jq -r '.endpoints.grpcAddress // empty' <<<"$ns_json")"
     [[ -n "$TEMPORAL_ADDRESS" ]] ||
         fail "namespace $TEMPORAL_NAMESPACE reports no regional gRPC endpoint"
 
-    local auth_method
-    auth_method="$(jq -r '.spec.authMethod // empty' <<<"$ns_json")"
-    [[ "$auth_method" == "ApiKey" ]] ||
-        fail "namespace $TEMPORAL_NAMESPACE uses authMethod=$auth_method; API keys need ApiKey"
+    # A boolean now rather than an authMethod string: the namespace can have API
+    # key auth enabled alongside mTLS, so this asks whether keys are accepted
+    # rather than which single method is configured.
+    local api_key_auth
+    api_key_auth="$(jq -r '.spec.apiKeyAuth.enabled // false' <<<"$ns_json")"
+    [[ "$api_key_auth" == "true" ]] ||
+        fail "namespace $TEMPORAL_NAMESPACE does not have API key auth enabled"
 }
 
 ########################################################################
@@ -157,9 +163,10 @@ vault_role() {
     # verify_propagation below is 0.3.1's default. It is passed explicitly so
     # this demo's behaviour stays put if that default ever moves again.
     local force=false adopted="" existing_id="" out=""
-    existing_id="$(tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account list 2>/dev/null |
+    existing_id="$(temporal cloud service-account list --api-key "$TEMPORAL_CLOUD_API_KEY" \
+        --page-size 100 -o json 2>/dev/null |
         jq -r --arg n "$WORKER_ROLE" \
-            'first(.serviceAccount[]? | select(.spec.name == $n) | .id) // empty')" || true
+            'first(.ServiceAccounts[]? | select(.spec.name == $n) | .id) // empty')" || true
     if [[ -n "$existing_id" ]]; then
         force=true
         adopted=", adopted from a previous run"
@@ -185,8 +192,9 @@ vault_role() {
             printf '  these permissions, and plugin %s cannot adopt an account it has nothing\n' \
                 "$PLUGIN_VERSION" >&2
             printf '  to change. Delete the orphan and re-run ./run.sh up:\n\n' >&2
-            printf '    tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account delete \\\n' >&2
-            printf '      --service-account-id %s\n\033[0m' "$existing_id" >&2
+            printf '    temporal cloud service-account delete \\\n' >&2
+            printf '      --service-account-id %s \\\n' "$existing_id" >&2
+            printf '      --api-key "$TEMPORAL_CLOUD_API_KEY"\n\033[0m' >&2
             exit 1
         fi
 

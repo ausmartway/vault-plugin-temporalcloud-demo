@@ -44,7 +44,7 @@ forget the credential on revoke — it calls Temporal Cloud and deletes it.
 
 ## What the demo does
 
-`demo.sh` walks six steps, each a real command:
+`demo.sh` walks seven steps, each a real command:
 
 1. **Register and mount the plugin.** Registration is by the binary's SHA256 —
    Vault refuses to load a plugin whose hash doesn't match. This is the
@@ -69,6 +69,16 @@ forget the credential on revoke — it calls Temporal Cloud and deletes it.
 5. **Show the lease.** Renewal extends it without ever calling Temporal Cloud.
 6. **Revoke.** The same key is rejected seconds later — because it no longer
    exists.
+7. **Retire the bootstrap key.** `rotate-root` mints a replacement on the same
+   service account, verifies it, stores it, and deletes the key it replaced —
+   so the one long-lived credential in the demo is gone by the end, and the
+   engine runs on a root key no human has seen.
+
+> **The demo consumes your bootstrap key.** Step 7 deletes the
+> `TEMPORAL_CLOUD_API_KEY` in your `.env` from Temporal Cloud. That is the
+> point — provision a throwaway admin service-account key per demo — but it
+> means every run needs a fresh one, and `make reset` cannot sweep orphaned
+> accounts afterwards until you supply it.
 
 ---
 
@@ -77,8 +87,8 @@ forget the credential on revoke — it calls Temporal Cloud and deletes it.
 | Tool | Why |
 |---|---|
 | `docker` | Runs Vault. No `vault` binary needed on the host — the demo drives the CLI inside the container. |
-| [`tcld`](https://docs.temporal.io/cloud/tcld) | Verifies what actually happened in Temporal Cloud at each step. |
-| `jq` | Parsing `tcld` output. |
+| [`temporal`](https://docs.temporal.io/cli) | The CLI, ≥1.8. Its `temporal cloud` commands verify what actually happened in Temporal Cloud at each step. Replaces `tcld`. |
+| `jq` | Parsing `temporal cloud … -o json` output. |
 | `pv` | demo-magic simulates typing with it. Interactive runs only — `make auto` doesn't need it. Not preinstalled on macOS: `brew install pv`. |
 | `curl`, `unzip`, `shasum` | Fetching and verifying the plugin release. |
 
@@ -89,10 +99,11 @@ You also need a Temporal Cloud account with:
   owner, so a *user*-owned key configures fine and then fails on the first
   `vault read creds/...`. Verify with:
   ```bash
-  tcld --api-key "$TEMPORAL_CLOUD_API_KEY" apikey list \
-    | jq -r '.apiKeys[] | "\(.spec.displayName)\t\(.owner.ownerType)"'
+  temporal cloud apikey list --api-key "$TEMPORAL_CLOUD_API_KEY"
   ```
-  You want `ApikeyOwnerTypeServiceAccount`.
+  You want `SERVICE_ACCOUNT` in the `OwnerType` column. Use the plain table
+  rather than `-o json` — the JSON leaves owner type as an integer enum, while
+  the table renders it.
 - *At least one namespace*, for the namespace-scoped role in step 3.
 
 ---
@@ -157,7 +168,7 @@ under your preferred process supervisor.
 ## How it's wired
 
 `make up` fetches and verifies the plugin binary, then starts Vault with that
-binary available. `demo.sh` drives the Vault CLI inside the container, and `tcld`
+binary available. `demo.sh` drives the Vault CLI inside the container, and `temporal cloud`
 verifies each effect against Temporal Cloud independently.
 
 ```text
@@ -177,7 +188,7 @@ verifies each effect against Temporal Cloud independently.
             │  vault read   temporalcloud/creds/…            ──► mints an API key
             │  vault lease revoke                            ──► deletes the API key
             │
-            └─ tcld … (read-only, verifies each effect independently)
+            └─ temporal cloud … (read-only, verifies each effect independently)
 ```
 
 Vault runs in *dev mode*: in-memory storage, auto-unsealed, a single known
@@ -245,7 +256,7 @@ different plane, and that one lags independently. On back-to-back runs of
 `demo.sh`, one run passed instantly; the next rejected a fresh key and accepted
 a revoked one, while `apikey list` already reported zero keys. That is why
 `wait_for_key_valid` and `wait_for_key_revoked` wrap only the two
-`tcld --api-key "$API_KEY"` calls, and require several consecutive identical
+`temporal cloud … --api-key "$API_KEY"` calls, and require several consecutive identical
 results before moving on.
 
 **`failed to load plugin` at container start** — something other than the

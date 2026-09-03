@@ -205,7 +205,7 @@ Everything the parent demo needs, plus:
 | `helm` | Installs the Vault Secrets Operator during `up`. |
 
 Your `.env` in the parent directory supplies everything else. The regional gRPC
-endpoint is read from your account with `tcld namespace get`, not hardcoded,
+endpoint is read from your account with `temporal cloud namespace get`, not hardcoded,
 because it differs per account and per region.
 
 Note: **API key authentication requires the *regional* endpoint**
