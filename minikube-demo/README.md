@@ -226,12 +226,13 @@ credential that connects successfully and is then refused when it tries to do
 anything: `client.Dial` returns a working client, and the worker's first poll
 comes back `Request unauthorized`.
 
-The plugin closes that window itself now. This role is created with
-`verify_propagation=true`, and `temporalcloud/config/probe` sets the policy for
-the mount: plugin 0.3.0 opens ten independent connections to the namespace
-frontend, 50ms apart, and only returns the key once all ten succeed. The wait
-happens inside `vault read creds/…` — before anything in the cluster ever
-sees the credential.
+The plugin closes that window itself now. Propagation verification is on by
+default as of 0.3.1 — this role sets `verify_propagation=true` explicitly anyway,
+so the behaviour stays pinned if that default ever moves — and
+`temporalcloud/config/probe` sets the policy for the mount: ten independent
+connections to the namespace frontend, 50ms apart, returning the key only once
+all ten succeed. The wait happens inside `vault read creds/…` — before anything
+in the cluster ever sees the credential.
 
 The worker still retries, and the retry still has to wrap the *first poll*, not
 just the dial. That matters if you ever mint a key without the probe: protecting

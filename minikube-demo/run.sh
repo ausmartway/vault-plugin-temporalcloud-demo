@@ -79,7 +79,7 @@ preflight() {
 # looks like a credential problem and is not.
 resolve_endpoint() {
     local ns_json
-    ns_json="$(tcld --api-key "$TEMPORAL_API_KEY" namespace get \
+    ns_json="$(tcld --api-key "$TEMPORAL_CLOUD_API_KEY" namespace get \
         --namespace "$TEMPORAL_NAMESPACE" 2>/dev/null)" ||
         fail "could not read namespace $TEMPORAL_NAMESPACE from Temporal Cloud"
 
@@ -121,9 +121,10 @@ vault_up() {
     if vault read "$MOUNT/config" >/dev/null 2>&1; then
         info "bootstrap credential already configured"
     else
+        # One field: 0.3.1 derives both the key's ID and its owning service
+        # account from the key itself.
         vault write "$MOUNT/config" \
-            api_key="$TEMPORAL_API_KEY" \
-            admin_service_account_id="$TEMPORAL_ADMIN_SA_ID" >/dev/null
+            api_key="$TEMPORAL_CLOUD_API_KEY" >/dev/null
         info "bootstrap credential configured"
     fi
 
@@ -152,8 +153,11 @@ vault_role() {
     #
     # Decided by asking Temporal Cloud rather than by matching the plugin's
     # error text, which is not an API and changes between versions.
+    #
+    # verify_propagation below is 0.3.1's default. It is passed explicitly so
+    # this demo's behaviour stays put if that default ever moves again.
     local force=false adopted="" existing_id="" out=""
-    existing_id="$(tcld --api-key "$TEMPORAL_API_KEY" service-account list 2>/dev/null |
+    existing_id="$(tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account list 2>/dev/null |
         jq -r --arg n "$WORKER_ROLE" \
             'first(.serviceAccount[]? | select(.spec.name == $n) | .id) // empty')" || true
     if [[ -n "$existing_id" ]]; then
@@ -169,7 +173,7 @@ vault_role() {
         ttl="$WORKER_TTL" max_ttl="$WORKER_TTL" \
         description='Money-transfer worker, credential synced by VSO' 2>&1)"; then
 
-        # Plugin 0.3.0 adopts by issuing UpdateServiceAccount unconditionally,
+        # Plugin 0.3.1 adopts by issuing UpdateServiceAccount unconditionally,
         # and Temporal Cloud rejects an update that changes nothing. An orphan
         # this demo created already matches this spec exactly, so the most
         # ordinary recovery of all is the one adoption cannot complete. Say so
@@ -181,7 +185,7 @@ vault_role() {
             printf '  these permissions, and plugin %s cannot adopt an account it has nothing\n' \
                 "$PLUGIN_VERSION" >&2
             printf '  to change. Delete the orphan and re-run ./run.sh up:\n\n' >&2
-            printf '    tcld --api-key "$TEMPORAL_API_KEY" service-account delete \\\n' >&2
+            printf '    tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account delete \\\n' >&2
             printf '      --service-account-id %s\n\033[0m' "$existing_id" >&2
             exit 1
         fi
@@ -408,7 +412,7 @@ current_pod() {
 # neither deserves a wrong answer.
 #
 # It is no longer the credential. This role sets verify_propagation=true, so
-# plugin 0.3.0 confirmed the namespace grant on ten frontend connections before
+# plugin 0.3.1 confirmed the namespace grant on ten frontend connections before
 # Vault returned the key — a refusal here should now be rare rather than
 # expected. What remains is that the probe samples the frontends it can reach,
 # and that the worker may simply not have polled yet. Retrying covers both
@@ -563,11 +567,22 @@ cmd_transfer() {
         fail "could not mint a starter credential — check 'vault read $MOUNT/config'"
     key="$TEMP_KEY"
     info "minted a starter credential from $MOUNT/creds/$WORKER_ROLE"
+    # One name for a Temporal Cloud API key throughout the demo. In .env it
+    # holds the admin bootstrap key; here it holds the short-lived,
+    # namespace-scoped key Vault just minted, and this assignment shadows the
+    # inherited admin value for the starter alone. The starter therefore never
+    # runs as the account admin, and nothing downstream has to learn a second
+    # variable name.
+    #
+    # This handoff is for a process the demo launches. Workloads in the cluster
+    # take no part in it: the worker reads its key from the mounted Secret at
+    # /vault/creds/api-key, so a rotated credential reaches it without any
+    # environment variable being involved.
     (
         cd "$DEMO_DIR/app" &&
             TEMPORAL_ADDRESS="$TEMPORAL_ADDRESS" \
                 TEMPORAL_NAMESPACE="$TEMPORAL_NAMESPACE" \
-                TEMPORAL_API_KEY="$key" \
+                TEMPORAL_CLOUD_API_KEY="$key" \
                 go run ./start
     ) || fail "the transfer did not complete"
 }

@@ -46,6 +46,13 @@ rm -rf "$PLUGIN_DIR"
 # A crash between minting and revoking can leave a service account behind in
 # Temporal Cloud that Vault no longer knows about. Check for those by name so
 # the next demo starts from a genuinely clean account.
+#
+# Both demo families are swept. This Vault runs in dev mode, so stopping its
+# container — a laptop reboot, a Docker Desktop restart — discards every role
+# while the accounts they created live on. The plugin then refuses to mint
+# against an account it did not create, and `up` fails on a name this repo
+# created itself, so a sweep that covered only demo-app-* left the Kubernetes
+# demo permanently wedged after something as ordinary as a reboot.
 if command -v tcld >/dev/null 2>&1; then
     echo "==> Checking Temporal Cloud for orphaned demo service accounts"
     # Report a failed lookup instead of swallowing it. Under `set -euo pipefail`
@@ -54,15 +61,17 @@ if command -v tcld >/dev/null 2>&1; then
     # cannot run is exactly when you need to be told.
     # --page-size: tcld pages at 10 by default, which would hide orphans on an
     # account that has more than ten service accounts.
-    if ! sa_list="$(tcld --api-key "$TEMPORAL_API_KEY" service-account list --page-size 100 2>&1)"; then
-        echo "    could not reach Temporal Cloud — check for leftover demo-app-* accounts by hand"
+    if ! sa_list="$(tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account list --page-size 100 2>&1)"; then
+        echo "    could not reach Temporal Cloud — check for leftover demo-app-* and demo-k8s-worker* accounts by hand"
         sa_list='{}'
     fi
-    orphans="$(jq -r '.serviceAccount[]? | select(.spec.name | startswith("demo-app-")) | "\(.id)\t\(.spec.name)"' <<<"$sa_list")"
+    orphans="$(jq -r '.serviceAccount[]?
+        | select(.spec.name | startswith("demo-app-") or startswith("demo-k8s-worker"))
+        | "\(.id)\t\(.spec.name)"' <<<"$sa_list")"
     if [[ -n "$orphans" ]]; then
         echo "$orphans" | while IFS=$'\t' read -r id name; do
             echo "    deleting orphan: $name ($id)"
-            tcld --api-key "$TEMPORAL_API_KEY" service-account delete --service-account-id "$id" >/dev/null 2>&1 ||
+            tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account delete --service-account-id "$id" >/dev/null 2>&1 ||
                 echo "    could not delete $name — remove it in the Temporal Cloud UI"
         done
     else

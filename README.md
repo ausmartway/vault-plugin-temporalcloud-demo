@@ -49,20 +49,23 @@ forget the credential on revoke — it calls Temporal Cloud and deletes it.
 1. **Register and mount the plugin.** Registration is by the binary's SHA256 —
    Vault refuses to load a plugin whose hash doesn't match. This is the
    supply-chain check, and it's why the release ships `_SHA256SUMS`.
-2. **Configure the mount.** Supply the last static bootstrap key and set the
-   mount-wide propagation probe to ten successes at 50 ms intervals. Reading
-   `config` back shows the key never comes out again.
+2. **Configure the mount.** Supply the last static bootstrap key — just the key,
+   one field — and set the mount-wide propagation probe to ten successes at
+   50 ms intervals. Reading `config` back shows the key never comes out again,
+   and shows the key ID and owning service account that plugin 0.3.1 derived
+   from it. The same lookup rejects a user-owned key here rather than at first
+   use, and requires the owner to hold the Global Admin role.
 3. **Define three roles** — one with account-wide read, one scoped to a single
    namespace, one `metrics-read` for a scraper that should never see a
    workflow. Each creates a real service account in Temporal Cloud. These are
    templates; no API key exists yet.
-4. **Read a credential.** Vault mints a key and returns it under a lease. For
-   the namespace-granted role, plugin 0.3.0 verifies propagation with ten
-   independent namespace-frontend connections over at least 450 milliseconds
-   before returning; the demo then uses the key against
-   Temporal Cloud. The same read runs three times — three distinct keys under
-   three independent leases, because nothing is cached or shared between
-   consumers.
+4. **Read a credential.** Vault mints a key and returns it under a lease. Plugin
+   0.3.1 verifies propagation by default: ten independent namespace-frontend
+   connections over at least 450 milliseconds before returning. Only the
+   namespace-granted role has a namespace to check, so that is the one where the
+   wait is visible. The demo then uses the key against Temporal Cloud. The same
+   read runs three times — three distinct keys under three independent leases,
+   because nothing is cached or shared between consumers.
 5. **Show the lease.** Renewal extends it without ever calling Temporal Cloud.
 6. **Revoke.** The same key is rejected seconds later — because it no longer
    exists.
@@ -86,7 +89,7 @@ You also need a Temporal Cloud account with:
   owner, so a *user*-owned key configures fine and then fails on the first
   `vault read creds/...`. Verify with:
   ```bash
-  tcld --api-key "$TEMPORAL_API_KEY" apikey list \
+  tcld --api-key "$TEMPORAL_CLOUD_API_KEY" apikey list \
     | jq -r '.apiKeys[] | "\(.spec.displayName)\t\(.owner.ownerType)"'
   ```
   You want `ApikeyOwnerTypeServiceAccount`.
@@ -126,7 +129,7 @@ make performance-test
 The test takes one sample per minute for 12 hours. Each sample measures the
 wall-clock time for `vault read` to return a newly issued key, then immediately
 uses that key for `DescribeNamespace` against the namespace frontend—the same
-RPC plugin 0.3.0 uses for propagation verification. There are no validation
+RPC plugin 0.3.1 uses for propagation verification. There are no validation
 retries: `valid=true` means the first independent call after Vault returned
 succeeded. If that call returns `valid=false`, the test immediately increases
 the mount's `consecutive_successes` setting by one for subsequent credentials,
@@ -249,7 +252,7 @@ results before moving on.
 plugin binary is in `./plugins/`. `make reset && make up`.
 
 **`api_key is required`** on `vault write config` — `.env` wasn't loaded, or
-`TEMPORAL_API_KEY` is empty.
+`TEMPORAL_CLOUD_API_KEY` is empty.
 
 **Credentials fail with a permission error** — the bootstrap key is probably
 user-owned rather than service-account-owned. See Prerequisites.

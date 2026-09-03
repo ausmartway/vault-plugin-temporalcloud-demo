@@ -23,9 +23,9 @@ fi
 # that silently omits what you are looking for is worse than no status check.
 # `apikey list` has no such flag, so nothing to do there.
 hdr "Temporal Cloud service accounts"
-tcld --api-key "$TEMPORAL_API_KEY" service-account list --page-size 100 |
+tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account list --page-size 100 |
     jq -r '.serviceAccount[] | "\(.spec.name)\t\(.spec.access.accountAccess.role)\t\(.id)"'
 
 hdr "Temporal Cloud API keys"
-tcld --api-key "$TEMPORAL_API_KEY" apikey list |
+tcld --api-key "$TEMPORAL_CLOUD_API_KEY" apikey list |
     jq -r '.apiKeys[] | "\(.spec.displayName)\towner=\(.owner.ownerType)\texpires=\(.spec.expiryTime)"'

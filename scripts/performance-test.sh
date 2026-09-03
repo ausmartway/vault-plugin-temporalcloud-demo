@@ -2,7 +2,7 @@
 # Measure credential issuance and immediate usability for 12 hours by default.
 #
 # Each sample performs exactly one Vault creds read, immediately calls the same
-# Temporal namespace frontend RPC used by plugin 0.3.0's propagation probe, and
+# Temporal namespace frontend RPC used by plugin 0.3.1's propagation probe, and
 # then revokes the lease. API keys are never written to the results file.
 
 # shellcheck source=./common.sh
@@ -134,8 +134,7 @@ fi
 
 if ! vault read "$MOUNT/config" >/dev/null 2>&1; then
     vault write "$MOUNT/config" \
-        api_key="$TEMPORAL_API_KEY" \
-        admin_service_account_id="$TEMPORAL_ADMIN_SA_ID" >/dev/null ||
+        api_key="$TEMPORAL_CLOUD_API_KEY" >/dev/null ||
         fail "could not configure $MOUNT with the bootstrap credential"
 fi
 

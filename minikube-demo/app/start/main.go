@@ -24,9 +24,13 @@ import (
 
 func main() {
 	c, err := client.Dial(client.Options{
-		HostPort:          mustEnv("TEMPORAL_ADDRESS"),
-		Namespace:         mustEnv("TEMPORAL_NAMESPACE"),
-		Credentials:       client.NewAPIKeyStaticCredentials(mustEnv("TEMPORAL_API_KEY")),
+		HostPort:  mustEnv("TEMPORAL_ADDRESS"),
+		Namespace: mustEnv("TEMPORAL_NAMESPACE"),
+		// TEMPORAL_CLOUD_API_KEY is the one name a Temporal Cloud API key goes
+		// by in this demo. run.sh sets it for this process to the short-lived,
+		// namespace-scoped key Vault minted for this transfer, rather than the
+		// admin bootstrap key of the same name in .env.
+		Credentials:       client.NewAPIKeyStaticCredentials(mustEnv("TEMPORAL_CLOUD_API_KEY")),
 		ConnectionOptions: client.ConnectionOptions{TLS: &tls.Config{}},
 	})
 	if err != nil {

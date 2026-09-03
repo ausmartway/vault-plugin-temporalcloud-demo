@@ -27,7 +27,7 @@ require_vault_running
 # before the first slide instead.
 preflight_clean() {
     local existing
-    existing="$(tcld --api-key "$TEMPORAL_API_KEY" service-account list --page-size 100 2>/dev/null |
+    existing="$(tcld --api-key "$TEMPORAL_CLOUD_API_KEY" service-account list --page-size 100 2>/dev/null |
         jq -r '.serviceAccount[]? | select(.spec.name | startswith("demo-app-")) | .spec.name' || true)"
     [[ -z "$existing" ]] && return 0
     echo "ERROR: these demo service accounts already exist in Temporal Cloud:" >&2
@@ -69,11 +69,11 @@ if [[ "${AUTO_PLAY_MODE:-0}" == "1" ]]; then
 fi
 
 # Read-only helper so the narration commands look like the real thing on screen.
-tc() { tcld --api-key "$TEMPORAL_API_KEY" "$@"; }
+tc() { tcld --api-key "$TEMPORAL_CLOUD_API_KEY" "$@"; }
 
-# Plugin 0.3.0 verifies a newly minted key with ten independent connections
+# Plugin 0.3.1 verifies a newly minted key with ten independent connections
 # to each namespace frontend over at least 450ms before returning it. The probe
-# policy is configured once per mount; the namespace-granted role below opts in.
+# policy is configured once per mount and every role verifies by default.
 # Revocation still crosses from the Cloud Ops resource plane to the auth plane,
 # so keep one waiter for the deliberately reused key. Several consecutive
 # failures are required because a single auth probe can be unreliable.
@@ -180,22 +180,26 @@ pe "vault secrets enable -path=$MOUNT $PLUGIN_NAME"
 ########################################################################
 say "2. Give Vault one bootstrap credential — the last static key"
 ########################################################################
-# admin_service_account_id is required and not optional trivia: an API key
-# token does not say who owns it, and the Cloud Ops API cannot look it up, so
-# Vault has to be told.
-# Two fields, not three: as of plugin 0.1.0 api_key_id is read-only and a
-# supplied value is rejected outright. A Temporal Cloud API key is a JWT that
-# names its own ID, so the engine reads it out of the key — which means the ID
-# rotate-root will one day delete always matches the key actually stored,
-# instead of whatever an operator pasted next to it.
+# One field. Everything else about this credential, Vault works out for itself.
+#
+# api_key_id has been read-only since 0.1.0: a Temporal Cloud API key is a JWT
+# that names its own ID, so the engine reads it out of the key rather than
+# trusting a pasted value.
+#
+# admin_service_account_id joined it in 0.3.1. The key's own ID is enough to ask
+# Cloud Ops who owns it, so the owning service account is derived too — and the
+# same lookup rejects a user-owned key here, at config time, instead of at the
+# first `vault read creds/...`. Supplying the field is still allowed as a
+# cross-check, but there is nothing an operator can get right that the key does
+# not already say.
 # Kept on one line on purpose: demo-magic runs commands through `eval $@`
 # unquoted, so backslash-continuations get mangled before Vault ever sees them.
-pe "vault write $MOUNT/config api_key=\"\$TEMPORAL_API_KEY\" admin_service_account_id=\"\$TEMPORAL_ADMIN_SA_ID\""
+pe "vault write $MOUNT/config api_key=\"\$TEMPORAL_CLOUD_API_KEY\""
 
-say "Plugin 0.3.0 configures propagation sampling once for the whole mount."
+say "Plugin 0.3.1 configures propagation sampling once for the whole mount."
 pe "vault write $MOUNT/config/probe interval=50ms consecutive_successes=10"
 
-say "Read them back — the bootstrap key never comes out again, but note api_key_id: Vault derived that from the key itself."
+say "Read them back — the bootstrap key never comes out again, but note api_key_id and admin_service_account_id: Vault derived both from the key itself."
 pe "vault read $MOUNT/config"
 pe "vault read $MOUNT/config/probe"
 
@@ -214,7 +218,10 @@ say "Role B — that same account-level read, plus write on exactly one namespac
 # The `read` floor is this plugin's rule (account_role is required on every
 # write), not Temporal Cloud's: the Cloud API accepts a service account with no
 # account-level role at all.
-pe "vault write $MOUNT/service-accounts/$SA_SCOPED account_role=read namespace_access=\"\$TEMPORAL_NAMESPACE=write\" verify_propagation=true ttl=5m max_ttl=1h description='Account read, plus write on one namespace'"
+# No verify_propagation here: 0.3.1 turns it on by default. All three roles get
+# it, but only this one has a namespace_access entry, and a namespace grant is
+# the only thing there is to verify — so B is where it does any work.
+pe "vault write $MOUNT/service-accounts/$SA_SCOPED account_role=read namespace_access=\"\$TEMPORAL_NAMESPACE=write\" ttl=5m max_ttl=1h description='Account read, plus write on one namespace'"
 
 pe "vault read $MOUNT/service-accounts/$SA_SCOPED"
 
@@ -261,11 +268,11 @@ fi
 say "Capture one and actually use it."
 pe "API_KEY=\$(vault read -field=api_key $MOUNT/creds/$SA_SCOPED)"
 
-say "Plugin 0.3.0 verified the key on ten independent frontend connections before Vault returned it:"
+say "Plugin 0.3.1 verified the key on ten independent frontend connections before Vault returned it — on by default, nothing to opt into:"
 # Be careful what this claims. The command proves the key authenticates;
-# verify_propagation is what tested the namespace grant before the creds read
-# returned. Demonstrating exclusion would take a second namespace this key was
-# deliberately not given.
+# propagation verification is what tested the namespace grant before the creds
+# read returned. Demonstrating exclusion would take a second namespace this key
+# was deliberately not given.
 pe_ok "tcld --api-key \"\$API_KEY\" namespace list"
 
 say "A credential Vault minted seconds ago, authenticating against Temporal Cloud."
