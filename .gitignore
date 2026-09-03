@@ -1,5 +1,8 @@
 # Real credentials live here. Never commit — see .env.example for the shape.
 .env
+# Any local variant: .env.local, .env.bak, and anything else alongside it.
+.env.*
+!.env.example
 
 # Downloaded plugin binary + release artifacts (fetched by scripts/fetch-plugin.sh)
 plugins/
@@ -15,3 +18,8 @@ docs/superpowers/
 # Which Vault lease the minikube worker is currently holding. Runtime state,
 # rewritten on every `run.sh up` and `run.sh rotate`.
 minikube-demo/.worker-lease
+
+# Customer-facing decks and their build directories. This repository is public;
+# slide material names accounts and opportunities and does not belong in it.
+*.pptx
+.tmp-slides/
