@@ -2,7 +2,7 @@
 # Measure credential issuance and immediate usability for 12 hours by default.
 #
 # Each sample performs exactly one Vault creds read, immediately calls the same
-# Temporal namespace frontend RPC used by plugin 0.3.1's propagation probe, and
+# Temporal namespace frontend RPC used by the plugin's propagation probe, and
 # then revokes the lease. API keys are never written to the results file.
 
 # shellcheck source=./common.sh

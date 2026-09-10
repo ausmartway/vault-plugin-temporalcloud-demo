@@ -10,6 +10,14 @@
 # shellcheck source=scripts/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/scripts/common.sh"
 
+cleanup_failed=false
+
+print_indented() {
+    while IFS= read -r line; do
+        printf '      %s\n' "$line"
+    done <<<"$1"
+}
+
 # Defined in common.sh so these are always the names demo.sh just created.
 SA_NAMES=("$SA_BROAD" "$SA_SCOPED" "$SA_METRICS")
 
@@ -36,8 +44,9 @@ echo "==> Stopping Vault"
 # leaving a container holding port 8200 that the operator was told was gone.
 if ! down_output="$(docker compose -f "$REPO_ROOT/docker-compose.yml" down -v 2>&1)"; then
     echo "    could not stop Vault:"
-    echo "$down_output" | sed 's/^/      /'
+    print_indented "$down_output"
     echo "    run 'docker compose down -v' by hand before the next demo"
+    cleanup_failed=true
 fi
 
 echo "==> Removing the downloaded plugin binary"
@@ -54,6 +63,32 @@ rm -rf "$PLUGIN_DIR"
 # created itself, so a sweep that covered only demo-app-* left the Kubernetes
 # demo permanently wedged after something as ordinary as a reboot.
 if command -v temporal >/dev/null 2>&1; then
+    echo "==> Checking Temporal Cloud for orphaned temporary bootstrap keys"
+    if bootstrap_list="$(temporal cloud apikey list \
+        --api-key "$TEMPORAL_CLOUD_API_KEY" --page-size 100 -o json 2>&1)"; then
+        bootstrap_keys="$(jq -r '.ApiKeys[]?
+            | select(.spec.display_name | startswith("vault-demo-bootstrap-"))
+            | "\(.id)\t\(.spec.display_name)"' <<<"$bootstrap_list")"
+        if [[ -n "$bootstrap_keys" ]]; then
+            while IFS=$'\t' read -r id name; do
+                echo "    deleting orphan: $name ($id)"
+                if ! delete_output="$(temporal cloud apikey delete --key-id "$id" \
+                    --api-key "$TEMPORAL_CLOUD_API_KEY" \
+                    --auto-confirm --idempotent 2>&1)"; then
+                    echo "    could not delete $name"
+                    print_indented "$delete_output"
+                    cleanup_failed=true
+                fi
+            done <<<"$bootstrap_keys"
+        else
+            echo "    none found"
+        fi
+    else
+        echo "    could not list API keys"
+        print_indented "$bootstrap_list"
+        cleanup_failed=true
+    fi
+
     echo "==> Checking Temporal Cloud for orphaned demo service accounts"
     # Report a failed lookup instead of swallowing it. Under `set -euo pipefail`
     # a failing lookup here used to abort the whole reset with stderr discarded —
@@ -63,27 +98,41 @@ if command -v temporal >/dev/null 2>&1; then
     # account with many service accounts.
     if ! sa_list="$(temporal cloud service-account list --api-key "$TEMPORAL_CLOUD_API_KEY" \
         --page-size 100 -o json 2>&1)"; then
-        echo "    could not reach Temporal Cloud — if the demo ran to step 7, it deleted"
-        echo "    the key in .env; supply a fresh one, or remove leftover demo-app-* and"
-        echo "    demo-k8s-worker* accounts by hand"
+        echo "    could not reach Temporal Cloud — check that the setup key in .env is"
+        echo "    valid, or remove leftover demo-app-*, demo-k8s-worker*, and"
+        echo "    vault-demo-bootstrap-* accounts by hand"
         sa_list='{}'
+        cleanup_failed=true
     fi
     # ServiceAccounts, capitalised: `temporal cloud service-account list -o json`
     # capitalises the envelope, unlike `... get -o json` which does not.
     orphans="$(jq -r '.ServiceAccounts[]?
-        | select(.spec.name | startswith("demo-app-") or startswith("demo-k8s-worker"))
+        | select(.spec.name
+            | startswith("demo-app-")
+                or startswith("demo-k8s-worker")
+                or startswith("vault-demo-bootstrap-"))
         | "\(.id)\t\(.spec.name)"' <<<"$sa_list")"
     if [[ -n "$orphans" ]]; then
-        echo "$orphans" | while IFS=$'\t' read -r id name; do
+        while IFS=$'\t' read -r id name; do
             echo "    deleting orphan: $name ($id)"
-            temporal cloud service-account delete --service-account-id "$id" \
-                --api-key "$TEMPORAL_CLOUD_API_KEY" >/dev/null 2>&1 ||
+            if ! delete_output="$(temporal cloud service-account delete \
+                --service-account-id "$id" \
+                --api-key "$TEMPORAL_CLOUD_API_KEY" \
+                --auto-confirm 2>&1)"; then
                 echo "    could not delete $name — remove it in the Temporal Cloud UI"
-        done
-    else
+                print_indented "$delete_output"
+                cleanup_failed=true
+            fi
+        done <<<"$orphans"
+    elif [[ "$cleanup_failed" == false ]]; then
         echo "    none found"
     fi
 fi
 
 echo
+if [[ "$cleanup_failed" == true ]]; then
+    echo "Cleanup incomplete. Resolve the errors above before running 'make demo'."
+    exit 1
+fi
+
 echo "Clean. 'make demo' will start from scratch."

@@ -127,7 +127,7 @@ vault_up() {
     if vault read "$MOUNT/config" >/dev/null 2>&1; then
         info "bootstrap credential already configured"
     else
-        # One field: 0.3.1 derives both the key's ID and its owning service
+        # One field: the plugin derives both the key's ID and its owning service
         # account from the key itself.
         vault write "$MOUNT/config" \
             api_key="$TEMPORAL_CLOUD_API_KEY" >/dev/null
@@ -160,7 +160,7 @@ vault_role() {
     # Decided by asking Temporal Cloud rather than by matching the plugin's
     # error text, which is not an API and changes between versions.
     #
-    # verify_propagation below is 0.3.1's default. It is passed explicitly so
+    # verify_propagation below is the plugin's default. It is passed explicitly so
     # this demo's behaviour stays put if that default ever moves again.
     local force=false adopted="" existing_id="" out=""
     existing_id="$(temporal cloud service-account list --api-key "$TEMPORAL_CLOUD_API_KEY" \
@@ -180,7 +180,7 @@ vault_role() {
         ttl="$WORKER_TTL" max_ttl="$WORKER_TTL" \
         description='Money-transfer worker, credential synced by VSO' 2>&1)"; then
 
-        # Plugin 0.3.1 adopts by issuing UpdateServiceAccount unconditionally,
+        # The plugin adopts by issuing UpdateServiceAccount unconditionally,
         # and Temporal Cloud rejects an update that changes nothing. An orphan
         # this demo created already matches this spec exactly, so the most
         # ordinary recovery of all is the one adoption cannot complete. Say so
@@ -420,7 +420,7 @@ current_pod() {
 # neither deserves a wrong answer.
 #
 # It is no longer the credential. This role sets verify_propagation=true, so
-# plugin 0.3.1 confirmed the namespace grant on ten frontend connections before
+# the plugin confirmed the namespace grant on ten frontend connections before
 # Vault returned the key — a refusal here should now be rare rather than
 # expected. What remains is that the probe samples the frontends it can reach,
 # and that the worker may simply not have polled yet. Retrying covers both

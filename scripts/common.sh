@@ -23,7 +23,7 @@ set +a
 
 : "${TEMPORAL_CLOUD_API_KEY:?set TEMPORAL_CLOUD_API_KEY in .env}"
 : "${TEMPORAL_NAMESPACE:?set TEMPORAL_NAMESPACE in .env}"
-# No TEMPORAL_ADMIN_SA_ID: plugin 0.3.1 derives the owning service account from
+# No TEMPORAL_ADMIN_SA_ID: the plugin derives the owning service account from
 # the key's own Cloud Ops record, so there is nothing for an operator to supply
 # and nothing to keep in sync.
 # Deliberately no default: a fallback version here would be a second pin, and

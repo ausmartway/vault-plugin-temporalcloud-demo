@@ -227,7 +227,7 @@ anything: `client.Dial` returns a working client, and the worker's first poll
 comes back `Request unauthorized`.
 
 The plugin closes that window itself now. Propagation verification is on by
-default as of 0.3.1 — this role sets `verify_propagation=true` explicitly anyway,
+enabled by default — this role sets `verify_propagation=true` explicitly anyway,
 so the behaviour stays pinned if that default ever moves — and
 `temporalcloud/config/probe` sets the policy for the mount: ten independent
 connections to the namespace frontend, 50ms apart, returning the key only once

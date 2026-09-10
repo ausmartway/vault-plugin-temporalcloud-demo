@@ -33,7 +33,9 @@ preflight_clean() {
     # assumed.
     existing="$(temporal cloud service-account list --api-key "$TEMPORAL_CLOUD_API_KEY" \
         --page-size 100 -o json 2>/dev/null |
-        jq -r '.ServiceAccounts[]? | select(.spec.name | startswith("demo-app-")) | .spec.name' || true)"
+        jq -r '.ServiceAccounts[]?
+            | select(.spec.name | startswith("demo-app-") or startswith("vault-demo-bootstrap-"))
+            | .spec.name' || true)"
     [[ -z "$existing" ]] && return 0
     echo "ERROR: these demo service accounts already exist in Temporal Cloud:" >&2
     echo "$existing" | sed 's/^/  - /' >&2
@@ -41,6 +43,63 @@ preflight_clean() {
     exit 1
 }
 preflight_clean
+
+# Keep the personal key in .env as a stable setup credential. For the actual
+# demonstration, create a dedicated temporary Global Admin service account and
+# one disposable key on it. Vault sees only that service-account key. The exit
+# trap removes the temporary account and every key it owns, including the root
+# key created by rotate-root, while the personal setup key remains untouched.
+create_demo_bootstrap_identity() {
+    local service_account_json create_key_json
+
+    DEMO_BOOTSTRAP_SERVICE_ACCOUNT_NAME="vault-demo-bootstrap-$(date +%s)"
+    service_account_json="$(temporal cloud service-account create \
+        --name "$DEMO_BOOTSTRAP_SERVICE_ACCOUNT_NAME" \
+        --description "Temporary root identity created by the Vault demo" \
+        --account-role admin \
+        --api-key "$TEMPORAL_CLOUD_API_KEY" \
+        --auto-confirm -o json)"
+    DEMO_ADMIN_SERVICE_ACCOUNT_ID="$(jq -er '.serviceAccountId' <<<"$service_account_json")"
+
+    create_key_json="$(temporal cloud apikey create-for-service-account \
+        --service-account-id "$DEMO_ADMIN_SERVICE_ACCOUNT_ID" \
+        --display-name "vault-demo-bootstrap-key" \
+        --description "Disposable bootstrap key created by the Vault demo" \
+        --expiry-duration 24h \
+        --api-key "$TEMPORAL_CLOUD_API_KEY" \
+        --auto-confirm -o json)"
+    DEMO_BOOTSTRAP_KEY="$(jq -er '
+        [.. | objects | .token? // empty][0]
+    ' <<<"$create_key_json")"
+}
+
+cleanup_demo_bootstrap_identity() {
+    local service_account_id="${DEMO_ADMIN_SERVICE_ACCOUNT_ID:-}"
+
+    # If account creation succeeded but parsing its response did not, recover
+    # the ID by the unique name so an interrupted setup cannot leak an admin
+    # service account.
+    if [[ -z "$service_account_id" &&
+        -n "${DEMO_BOOTSTRAP_SERVICE_ACCOUNT_NAME:-}" ]]; then
+        service_account_id="$(temporal cloud service-account list \
+            --api-key "$TEMPORAL_CLOUD_API_KEY" --page-size 100 -o json 2>/dev/null |
+            jq -r --arg name "$DEMO_BOOTSTRAP_SERVICE_ACCOUNT_NAME" '
+                [.ServiceAccounts[]? | select(.spec.name == $name) | .id][0] // empty
+            ' || true)"
+    fi
+
+    [[ -n "$service_account_id" ]] || return 0
+    temporal cloud service-account delete \
+        --service-account-id "$service_account_id" \
+        --api-key "$TEMPORAL_CLOUD_API_KEY" --auto-confirm --idempotent \
+        >/dev/null 2>&1 || true
+}
+
+DEMO_BOOTSTRAP_SERVICE_ACCOUNT_NAME=""
+DEMO_ADMIN_SERVICE_ACCOUNT_ID=""
+DEMO_BOOTSTRAP_KEY=""
+trap cleanup_demo_bootstrap_identity EXIT
+create_demo_bootstrap_identity
 
 ########################################################################
 # demo-magic setup
@@ -73,7 +132,7 @@ if [[ "${AUTO_PLAY_MODE:-0}" == "1" ]]; then
     stty() { :; }
 fi
 
-# Plugin 0.3.1 verifies a newly minted key with ten independent connections
+# The plugin verifies a newly minted key with ten independent connections
 # to each namespace frontend over at least 450ms before returning it. The probe
 # policy is configured once per mount and every role verifies by default.
 # Revocation still crosses from the Cloud Ops resource plane to the auth plane,
@@ -184,15 +243,17 @@ pe "vault plugin register -sha256=$PLUGIN_SHA secret $PLUGIN_NAME"
 pe "vault secrets enable -path=$MOUNT $PLUGIN_NAME"
 
 ########################################################################
-say "2. Give Vault one bootstrap credential — the last static key"
+say "2. Give Vault one temporary bootstrap credential"
 ########################################################################
+say "The personal key in .env is only the setup identity. This run created a temporary Global Admin service account and a disposable 24-hour key for Vault to consume."
+
 # One field. Everything else about this credential, Vault works out for itself.
 #
 # api_key_id has been read-only since 0.1.0: a Temporal Cloud API key is a JWT
 # that names its own ID, so the engine reads it out of the key rather than
 # trusting a pasted value.
 #
-# admin_service_account_id joined it in 0.3.1. The key's own ID is enough to ask
+# The plugin also derives admin_service_account_id. The key's own ID is enough to ask
 # Cloud Ops who owns it, so the owning service account is derived too — and the
 # same lookup rejects a user-owned key here, at config time, instead of at the
 # first `vault read creds/...`. Supplying the field is still allowed as a
@@ -200,14 +261,14 @@ say "2. Give Vault one bootstrap credential — the last static key"
 # not already say.
 # Kept on one line on purpose: demo-magic runs commands through `eval $@`
 # unquoted, so backslash-continuations get mangled before Vault ever sees them.
-pe "vault write $MOUNT/config api_key=\"\$TEMPORAL_CLOUD_API_KEY\""
+pe "vault write $MOUNT/config api_key=\"\$DEMO_BOOTSTRAP_KEY\""
 
-# These are 0.3.1's own defaults (client/probe.go: 50ms, ten successes), so this
+# These are the plugin's own defaults (client/probe.go: 50ms, ten successes), so this
 # write changes nothing. It is here to put the knob on screen: the sampling
 # policy is set once per mount rather than per role, and an account that
 # propagates slowly is tuned here and nowhere else. Say so rather than letting
 # the narration imply the demo had to configure it.
-say "Propagation sampling is one policy for the whole mount, not a per-role setting. These are 0.3.1's defaults — writing them changes nothing, but this is the knob to turn if an account propagates slowly."
+say "Propagation sampling is one policy for the whole mount, not a per-role setting. These are the plugin's defaults — writing them changes nothing, but this is the knob to turn if an account propagates slowly."
 pe "vault write $MOUNT/config/probe interval=50ms consecutive_successes=10"
 
 say "Read them back — the bootstrap key never comes out again, but note api_key_id and admin_service_account_id: Vault derived both from the key itself."
@@ -229,7 +290,7 @@ say "Role B — that same account-level read, plus write on exactly one namespac
 # The `read` floor is this plugin's rule (account_role is required on every
 # write), not Temporal Cloud's: the Cloud API accepts a service account with no
 # account-level role at all.
-# No verify_propagation here: 0.3.1 turns it on by default. All three roles get
+# No verify_propagation here: the plugin turns it on by default. All three roles get
 # it, but only this one has a namespace_access entry, and a namespace grant is
 # the only thing there is to verify — so B is where it does any work.
 pe "vault write $MOUNT/service-accounts/$SA_SCOPED account_role=read namespace_access=\"\$TEMPORAL_NAMESPACE=write\" ttl=5m max_ttl=1h description='Account read, plus write on one namespace'"
@@ -288,7 +349,7 @@ fi
 say "Capture one and actually use it."
 pe "API_KEY=\$(vault read -field=api_key $MOUNT/creds/$SA_SCOPED)"
 
-say "Plugin 0.3.1 verified the key on ten independent frontend connections before Vault returned it — on by default, nothing to opt into:"
+say "The plugin verified the key on ten independent frontend connections before Vault returned it — on by default, nothing to opt into:"
 # Be careful what this claims. The command proves the key authenticates;
 # propagation verification is what tested the namespace grant before the creds
 # read returned. Demonstrating exclusion would take a second namespace this key
@@ -352,15 +413,12 @@ pe_ok "temporal cloud apikey list --api-key \"\$TEMPORAL_CLOUD_API_KEY\" -o json
 pause
 
 ########################################################################
-say "7. Retire the last static key"
+say "7. Retire the temporary bootstrap key"
 ########################################################################
-# Deliberately last, and it is one-way. rotate-root deletes the bootstrap key
-# in Temporal Cloud, which is the key .env holds — so every `temporal cloud` call in this
-# script stops working the moment it runs. Nothing below calls Temporal Cloud.
-#
-# That is also why the whole demo is safe to run against a throwaway admin key:
-# by the end there is nothing left worth keeping.
-say "Everything so far rested on one long-lived key — the one pasted into .env. Note the api_key_id Vault is holding now:"
+# rotate-root deletes the disposable key created for this run. The personal
+# setup key in .env is never handed to Vault and remains available to remove the
+# temporary admin service account when the script exits.
+say "Everything so far rested on the temporary bootstrap key created for this run. Note the api_key_id Vault is holding now:"
 pe "vault read $MOUNT/config"
 
 say "rotate-root mints a replacement on the same service account, verifies it, stores it, and deletes the key it replaced."
@@ -369,10 +427,10 @@ pe "vault write -f $MOUNT/config/rotate-root"
 say "Different api_key_id. Vault minted this one for itself, and no human has ever seen it:"
 pe "vault read $MOUNT/config"
 
-say "The key you pasted into .env is now gone from Temporal Cloud. This is expected to fail:"
-# The strongest proof available, and it costs nothing: the credential the
-# operator supplied is the one being rejected.
-pe "temporal cloud namespace list --api-key \"\$TEMPORAL_CLOUD_API_KEY\" || echo '>>> rejected — the bootstrap key no longer exists'"
+say "The temporary bootstrap key is now gone from Temporal Cloud. This is expected to fail:"
+# The strongest proof available: the disposable credential supplied to Vault
+# is the one being rejected. The setup key in .env remains untouched.
+pe "temporal cloud namespace list --api-key \"\$DEMO_BOOTSTRAP_KEY\" || echo '>>> rejected — the temporary bootstrap key no longer exists'"
 
 say "Vault carries on regardless, still minting against Temporal Cloud:"
 # Proof the mount is healthy on the new credential rather than merely quiet.
@@ -395,8 +453,10 @@ say "That's the model"
 #     is how you keep it fresh, and nothing outside Vault ever holds it.
 cat <<'EOF'
 
-  - No human ever saw a key an application uses. One long-lived key existed —
-    the bootstrap key from step 2 — and step 7 deleted it.
+  - No human ever saw a key an application uses. The demo created its own
+    temporary bootstrap key in step 2, and step 7 deleted it.
+  - The personal setup key in .env remains available for cleanup and future
+    demos; the temporary admin service account is removed when this script exits.
   - Access is scoped per role, not per person.
   - Revocation is one command, and it is real: the credential is deleted in
     Temporal Cloud, not just forgotten by Vault.
@@ -405,9 +465,7 @@ To delete the service accounts and tear Vault down, run `make reset`.
 
 EOF
 
-# Said after the summary, in red, because it is the one thing that will bite
-# the next person to run this. Step 7 deleted the key .env holds; a rerun needs
-# a new one, and `make reset`'s orphan sweep cannot reach Temporal Cloud until
-# it has one.
-printf '\033[1;31mTEMPORAL_CLOUD_API_KEY in .env no longer works — step 7 deleted it.\n'
-printf 'Put a fresh admin service-account key in .env before running this again.\033[0m\n\n'
+printf '\033[1;32mThe personal key in .env was not handed to Vault and still works.\n'
+printf "The temporary bootstrap service account will be removed as the demo exits.\n"
+printf "Run 'make reset'\n"
+printf 'to remove the application service accounts and stop Vault.\033[0m\n\n'

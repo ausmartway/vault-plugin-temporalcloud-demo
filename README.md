@@ -49,18 +49,17 @@ forget the credential on revoke — it calls Temporal Cloud and deletes it.
 1. **Register and mount the plugin.** Registration is by the binary's SHA256 —
    Vault refuses to load a plugin whose hash doesn't match. This is the
    supply-chain check, and it's why the release ships `_SHA256SUMS`.
-2. **Configure the mount.** Supply the last static bootstrap key — just the key,
-   one field — and set the mount-wide propagation probe to ten successes at
-   50 ms intervals. Reading `config` back shows the key never comes out again,
-   and shows the key ID and owning service account that plugin 0.3.1 derived
-   from it. The same lookup rejects a user-owned key here rather than at first
-   use, and requires the owner to hold the Global Admin role.
+2. **Configure the mount.** Use the personal setup key from `.env` to create a
+   temporary Global Admin service account and disposable 24-hour bootstrap key,
+   then give only that temporary key to Vault. Reading `config` back shows the
+   key never comes out again, and shows the key ID and owning service account
+   that the plugin derived from it.
 3. **Define three roles** — one with account-wide read, one scoped to a single
    namespace, one `metrics-read` for a scraper that should never see a
    workflow. Each creates a real service account in Temporal Cloud. These are
    templates; no API key exists yet.
-4. **Read a credential.** Vault mints a key and returns it under a lease. Plugin
-   0.3.1 verifies propagation by default: ten independent namespace-frontend
+4. **Read a credential.** Vault mints a key and returns it under a lease. The plugin
+   verifies propagation by default: ten independent namespace-frontend
    connections over at least 450 milliseconds before returning. Only the
    namespace-granted role has a namespace to check, so that is the one where the
    wait is visible. The demo then uses the key against Temporal Cloud. The same
@@ -69,16 +68,11 @@ forget the credential on revoke — it calls Temporal Cloud and deletes it.
 5. **Show the lease.** Renewal extends it without ever calling Temporal Cloud.
 6. **Revoke.** The same key is rejected seconds later — because it no longer
    exists.
-7. **Retire the bootstrap key.** `rotate-root` mints a replacement on the same
-   service account, verifies it, stores it, and deletes the key it replaced —
-   so the one long-lived credential in the demo is gone by the end, and the
-   engine runs on a root key no human has seen.
-
-> **The demo consumes your bootstrap key.** Step 7 deletes the
-> `TEMPORAL_CLOUD_API_KEY` in your `.env` from Temporal Cloud. That is the
-> point — provision a throwaway admin service-account key per demo — but it
-> means every run needs a fresh one, and `make reset` cannot sweep orphaned
-> accounts afterwards until you supply it.
+7. **Retire the temporary bootstrap key.** `rotate-root` mints a replacement
+   on the temporary service account, verifies it, stores it, and deletes the
+   disposable key created for this run. The personal setup key in `.env` is
+   never handed to Vault. When the demo exits, it removes the temporary service
+   account and every remaining key it owns.
 
 ---
 
@@ -94,16 +88,10 @@ forget the credential on revoke — it calls Temporal Cloud and deletes it.
 
 You also need a Temporal Cloud account with:
 
-- A *service-account-owned* API key with the `Admin` account role. This
-  matters: Temporal Cloud's `CreateApiKey` only accepts a service-account
-  owner, so a *user*-owned key configures fine and then fails on the first
-  `vault read creds/...`. Verify with:
-  ```bash
-  temporal cloud apikey list --api-key "$TEMPORAL_CLOUD_API_KEY"
-  ```
-  You want `SERVICE_ACCOUNT` in the `OwnerType` column. Use the plain table
-  rather than `-o json` — the JSON leaves owner type as an integer enum, while
-  the table renders it.
+- A personal Temporal Cloud API key owned by an Account Owner or Global Admin.
+  The demo uses it only as a setup identity: it creates a temporary Global
+  Admin service account and bootstrap key for Vault, then removes that service
+  account when the run ends. The personal key is never written to Vault.
 - *At least one namespace*, for the namespace-scoped role in step 3.
 
 ---
@@ -127,7 +115,7 @@ make demo
 | `make auto` | Same walkthrough, no keypresses — smoke test or screen recording |
 | `make performance-test` | Sample API-key issuance and immediate validity for 12 hours |
 | `make status` | What exists right now, in Vault *and* in Temporal Cloud |
-| `make reset` | Revoke leases, delete the demo service accounts, tear Vault down |
+| `make reset` | Revoke leases, remove temporary bootstrap keys and demo service accounts, then tear Vault down |
 | `make up` / `make down` | Start / stop Vault only |
 | `make plugin` | Checksum-verify the plugin binary, downloading it only if it isn't already there |
 
@@ -140,7 +128,7 @@ make performance-test
 The test takes one sample per minute for 12 hours. Each sample measures the
 wall-clock time for `vault read` to return a newly issued key, then immediately
 uses that key for `DescribeNamespace` against the namespace frontend—the same
-RPC plugin 0.3.1 uses for propagation verification. There are no validation
+RPC the plugin uses for propagation verification. There are no validation
 retries: `valid=true` means the first independent call after Vault returned
 succeeded. If that call returns `valid=false`, the test immediately increases
 the mount's `consecutive_successes` setting by one for subsequent credentials,
@@ -216,8 +204,10 @@ past the life of the key behind it, so a lease never outlives its credential.
 service account at *20 non-expired keys*, so 20 concurrent leases per role.
 More consumers means more roles, which you want anyway for scoping.
 
-**"Isn't the bootstrap key still a static key?"** Yes — for exactly as long as
-it takes to run:
+**"Isn't the bootstrap key still a static key?"** The demo uses the personal
+key in `.env` only to create and clean up a temporary bootstrap identity. It
+creates a 24-hour service-account key for Vault, and that temporary key exists
+only until this command runs:
 
 ```bash
 vault write -f temporalcloud/config/rotate-root
@@ -232,12 +222,10 @@ reads `api_key_id` out of the bootstrap key's own JWT instead of asking an
 operator to supply it, so the ID that `rotate-root` deletes always names the
 key actually in use.
 
-> **Caution:** `demo.sh` leaves `rotate-root` out on purpose. It deletes the key
-> in your `.env` and replaces it with one Vault never reveals, so the value in
-> `.env` stops working and you can't re-bootstrap this demo from it. Run it live
-> only if you're ready to mint a fresh bootstrap key afterwards. You also have to
-> re-run `rotate-root` before `root_key_ttl` (90 days by default) expires, or the
-> mount stops issuing credentials.
+> The replacement root key still carries `root_key_ttl` (90 days by default).
+> In a persistent deployment, run `rotate-root` again before it expires. The
+> local demo removes the temporary root service account when it exits, while
+> the personal setup key in `.env` remains untouched.
 
 ---
 
@@ -265,18 +253,20 @@ plugin binary is in `./plugins/`. `make reset && make up`.
 **`api_key is required`** on `vault write config` — `.env` wasn't loaded, or
 `TEMPORAL_CLOUD_API_KEY` is empty.
 
-**Credentials fail with a permission error** — the bootstrap key is probably
-user-owned rather than service-account-owned. See Prerequisites.
+**Temporary bootstrap creation fails with a permission error** — the setup key
+is probably user-owned or lacks permission to manage service-account API keys.
+See Prerequisites.
 
 **A demo died halfway and left things behind** — `make reset` is idempotent and
-sweeps orphaned `demo-app-*` service accounts out of Temporal Cloud.
+sweeps orphaned `vault-demo-bootstrap-*` keys and service accounts, plus
+`demo-app-*` service accounts, out of Temporal Cloud.
 
 ---
 
 ## What this is not
 
-Dev-mode Vault, a root token in a file, and a single bootstrap credential
-pasted in by hand. The *pattern* is production-shaped; this deployment is not.
+Dev-mode Vault, a root token in a file, and a setup credential loaded from
+`.env`. The *pattern* is production-shaped; this deployment is not.
 A production deployment has:
 
 - Real storage and a real seal
